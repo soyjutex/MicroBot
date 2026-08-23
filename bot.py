@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MicroBot v7.0.0 - Agente autonomo de administracion de sistemas para Telegram.
+MicroBot v7.1.0 - Agente autonomo de administracion de sistemas para Telegram.
 
 Caracteristicas principales:
     - Cerebro LLM (OpenRouter Free, costo cero) con protocolo JSON estricto: piensa, planifica, ejecuta, critica y aprende.
+    - Memoria semantica: SQLite + FTS5 inyecta solo los hechos relevantes a cada mensaje (zero-token bloat).
+    - Busqueda web quirurgica opcional (DuckDuckGo Lite, max 3 resultados / 600 chars) y compresion nocturna de memoria a las 04:00.
     - Multi-respuesta: ademas de la respuesta principal, ofrece hasta N alternativas.
     - Memoria persistente unificada en SQLite (facts, historial, errores, misiones, skills).
     - Misiones multi-paso con corte anti-bucle y pausa ante falta de permisos.
@@ -35,11 +37,13 @@ Estructura del archivo (busca los marcadores "=== SECCION ==="):
 
 import ast
 import datetime
+import fcntl
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -61,6 +65,7 @@ DEFAULTS = {
     "api_key": "",
     "provider": "openrouter",          # openrouter (gratis) | gemini
     "model": "openrouter/free",        # router automatico de modelos gratis de OpenRouter
+    "base_url": "https://openrouter.ai/api/v1",   # cualquier API compatible OpenAI (Groq, Ollama local, vLLM...)
     "telegram_token": "",
     "chat_id": "",
     "max_calls_per_day": 45,           # techo conservador: el tier free de OpenRouter da ~50/dia
@@ -181,6 +186,19 @@ class Store:
                 created TEXT NOT NULL);
         """)
         self.conn.commit()
+        # FTS5 (full-text search) para recuperacion semantica ligera de hechos.
+        # Si la build de SQLite no trae FTS5, se degrada a LIKE sin romper nada.
+        self.has_fts = False
+        try:
+            c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(ts, text)")
+            self.conn.commit()
+            n_fts = c.execute("SELECT COUNT(*) FROM facts_fts").fetchone()[0]
+            if n_fts != c.execute("SELECT COUNT(*) FROM facts").fetchone()[0]:
+                c.execute("INSERT INTO facts_fts (ts, text) SELECT ts, text FROM facts")
+                self.conn.commit()
+            self.has_fts = True
+        except Exception:
+            pass
 
     # --- clave/valor (estado simple: usage, auto, breaker...) ---------------
     def get(self, key, default=None):
@@ -192,13 +210,78 @@ class Store:
         self.conn.commit()
 
     # --- facts ---------------------------------------------------------------
+    STOPWORDS = frozenset(
+        "de la el los las un una unos unas y o a en que al del lo se su por para con sin sobre "
+        "es son esta estan fue ser soy estoy me mi mis tu tus le les lo hay aqui ahi the and for "
+        "with this that what when where how your you are was were have has had not but all can "
+        "cual cuales como cuando donde quien cuanto decime deci hace hacer quiero quiero podes".split()
+    )
+
     def add_fact(self, text):
-        self.conn.execute("INSERT INTO facts (ts, text) VALUES (?, ?)", (now_iso(), text[:500]))
+        ts = now_iso()
+        self.conn.execute("INSERT INTO facts (ts, text) VALUES (?, ?)", (ts, text[:500]))
+        if self.has_fts:
+            try:
+                self.conn.execute("INSERT INTO facts_fts (ts, text) VALUES (?, ?)", (ts, text[:500]))
+            except Exception:
+                pass
         self.conn.commit()
 
     def facts(self, limit=15):
         rows = self.conn.execute("SELECT text FROM facts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [r[0] for r in reversed(rows)]
+
+    def all_facts(self, limit=120):
+        rows = self.conn.execute("SELECT id, ts, text FROM facts ORDER BY id ASC LIMIT ?", (limit,)).fetchall()
+        return rows
+
+    def replace_facts(self, new_texts):
+        """Reemplaza TODOS los hechos (usado por la compresion nocturna)."""
+        c = self.conn.cursor()
+        c.execute("DELETE FROM facts")
+        if self.has_fts:
+            try:
+                c.execute("DELETE FROM facts_fts")
+            except Exception:
+                pass
+        for t in new_texts:
+            ts = now_iso()
+            c.execute("INSERT INTO facts (ts, text) VALUES (?, ?)", (ts, t[:500]))
+            if self.has_fts:
+                try:
+                    c.execute("INSERT INTO facts_fts (ts, text) VALUES (?, ?)", (ts, t[:500]))
+                except Exception:
+                    pass
+        self.conn.commit()
+
+    @staticmethod
+    def _keywords(text, max_kw=6):
+        kws = [w for w in re.findall(r"[a-z0-9]{4,}", str(text).lower())
+               if w not in Store.STOPWORDS]
+        return kws[:max_kw]
+
+    def relevant_facts(self, query, limit=5):
+        """Recuperacion semantica ligera: solo los hechos relevantes al mensaje.
+        Cero tokens de mas: FTS5 con MATCH si esta disponible, LIKE como fallback,
+        y solo como ultima opcion los hechos recientes."""
+        kws = self._keywords(query)
+        if not kws:
+            return self.facts(limit)
+        if self.has_fts:
+            try:
+                match = " OR ".join('"' + k.replace('"', '""') + '"' for k in kws)
+                rows = self.conn.execute(
+                    "SELECT text FROM facts_fts WHERE facts_fts MATCH ? ORDER BY rank LIMIT ?",
+                    (match, limit)).fetchall()
+                if rows:
+                    return [r[0] for r in rows]
+            except Exception:
+                pass
+        like = " OR ".join(["text LIKE ?"] * len(kws))
+        params = [f"%{k}%" for k in kws]
+        rows = self.conn.execute(
+            f"SELECT text FROM facts WHERE {like} ORDER BY id DESC LIMIT ?", params + [limit]).fetchall()
+        return [r[0] for r in rows] if rows else self.facts(limit)
 
     def count_facts(self):
         return self.conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
@@ -325,6 +408,35 @@ def resources_ok():
     return s["ram_free"] >= CFG["ram_min_mb"] and s["load1"] <= CFG["load_max"]
 
 
+_HOST_ID = None
+
+
+def host_identity():
+    """Identidad real del equipo donde corre: hostname, distro y CPU.
+    Leido en vivo para que MicroBot sea universal (sin hardcodear hardware)."""
+    global _HOST_ID
+    if _HOST_ID is None:
+        host = socket.gethostname()
+        os_name = ""
+        cpu = ""
+        try:
+            for line in open("/etc/os-release"):
+                if line.startswith("PRETTY_NAME="):
+                    os_name = line.split("=", 1)[1].strip().strip('"')
+                    break
+        except Exception:
+            pass
+        try:
+            for line in open("/proc/cpuinfo"):
+                if line.startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+        _HOST_ID = (host, os_name, cpu)
+    return _HOST_ID
+
+
 # ==============================================================================
 # === 5. EJECUCION DE COMANDOS ================================================
 # ==============================================================================
@@ -371,17 +483,24 @@ def notify(text):
 
 
 def call_openrouter(prompt, system_instruction):
-    """OpenRouter: API compatible OpenAI. El router 'openrouter/free' rota modelos
-    gratuitos; si alguno falla o devuelve vacio, se reintenta con un free fijo."""
-    for model in (CFG["model"], "nvidia/nemotron-3.5-lightning:free"):
+    """Cualquier API compatible OpenAI (OpenRouter por defecto). 'base_url' en
+    config.json permite usar Groq, Ollama local, vLLM u otro proveedor sin tocar codigo.
+    El router 'openrouter/free' rota modelos gratuitos; si alguno falla o devuelve
+    vacio, se reintenta con un free fijo (solo cuando el proveedor es OpenRouter)."""
+    base = str(CFG.get("base_url") or "https://openrouter.ai/api/v1").rstrip("/")
+    models = [CFG["model"]]
+    if "openrouter.ai" in base:
+        models.append("nvidia/nemotron-3.5-lightning:free")
+    for model in models:
         try:
-            url = "https://openrouter.ai/api/v1/chat/completions"
+            url = f"{base}/chat/completions"
             headers = {
-                "Authorization": f"Bearer {CFG['api_key']}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": "https://github.com/soyjutex/MicroBot",
                 "X-Title": "MicroBot",
             }
+            if CFG.get("api_key"):
+                headers["Authorization"] = f"Bearer {CFG['api_key']}"
             data = {
                 "model": model,
                 "max_tokens": 3000,   # modelos con reasoning queman tokens antes del contenido
@@ -472,20 +591,27 @@ def circuit_open(store):
     return bool(store.get("circuit_open")) and time.time() < store.get("backoff_until", 0)
 
 
-def build_system_prompt(store, system_extra=""):
-    """Construye la instruccion de sistema completa con todo el contexto del bot."""
+def build_system_prompt(user_input, store, system_extra=""):
+    """Construye la instruccion de sistema completa con todo el contexto del bot.
+    La memoria se inyecta por RELEVANCIA (FTS5): solo 3-5 hechos relacionados con
+    el mensaje, nunca todo el historial (zero-token bloat)."""
+    host, os_name, cpu_model = host_identity()
+    hw = f"CPU {cpu_model}" if cpu_model else "hardware generico"
+    mem = store.relevant_facts(user_input, 5)
+    mem_json = json.dumps(mem, ensure_ascii=False)[:700]
     context = (
-        f"HARDWARE REAL: Pentium Dual T3200 2GHz, 2GB RAM, HDD. Stats ahora: {get_sys_stats()['str']}. "
+        f"HARDWARE REAL: {hw}. Stats ahora: {get_sys_stats()['str']}. "
         f"NUNCA propongas tareas pesadas si hay pocos recursos. "
-        f"MEMORIA (facts): {json.dumps(store.facts(15), ensure_ascii=False)}. "
+        f"MEMORIA RELEVANTE (facts filtrados por similitud al mensaje): {mem_json}. "
         f"HISTORIAL RECIENTE: {json.dumps(store.recent_history(5), ensure_ascii=False)}. "
         f"ERRORES RECIENTES: {json.dumps(store.recent_errors(5), ensure_ascii=False)}. "
         f"SCRATCHPAD: {json.dumps(store.recent_scratch(8), ensure_ascii=False)}"
     )
     max_alt = CFG["max_alternatives"]
     return (
-        f"Eres MicroBot, admin L4 autonomo de compacserver (Debian 13), ciclo cerrado "
-        f"PENSAR-ACTUAR-OBSERVAR-APRENDER. Corres como root en una notebook dedicada exclusivamente a ti, "
+        f"Eres MicroBot, admin L4 autonomo de la maquina '{host}' ({os_name}), ciclo cerrado "
+        f"PENSAR-ACTUAR-OBSERVAR-APRENDER. Corres con los permisos del servicio en una maquina "
+        f"dedicada exclusivamente a ti, "
         f"pero mantenes la lista BLOCKED de comandos destructivos por seguridad propia. {context}. "
         f"MULTI-RESPUESTA: ademas del campo reply (respuesta principal clara y directa), genera hasta {max_alt} "
         f"alternativas utiles en 'alternatives': pueden ser otra forma de resolverlo, una sugerencia extra "
@@ -493,9 +619,12 @@ def build_system_prompt(store, system_extra=""):
         f"MISION_PROTOCOL: 1.ANALIZA 2.EJECUTA 3.OBSERVA 4.CRITICA 5.APRENDE. "
         f"status=SUCCESS cuando la tarea quedo resuelta; FAILED si es imposible; CONTINUE si falta iterar. "
         f"Para charla simple responde directo con status SUCCESS y sin plan (ahorra llamadas). "
+        f"Si el mensaje es una PREGUNTA sobre conocimiento o el pasado, NO ejecutes comandos: "
+        f"respondé desde MEMORIA RELEVANTE con status SUCCESS. "
         f"Responde SIEMPRE JSON exacto: {{"
-        f"\"thought\": \"razonamiento breve\", "
+        f"\"thought\": \"razonamiento conciso de maximo 2 lineas\", "
         f"\"plan\": [{{\"cmd\": \"bash\", \"expect\": \"esperado\"}}], "
+        f"\"search\": \"consulta web opcional SOLO si necesitas datos de internet actuales\", "
         f"\"reply\": \"respuesta principal breve\", "
         f"\"alternatives\": [\"variante opcional\", \"otra opcion extra\"], "
         f"\"new_fact\": \"dato permanente opcional\", "
@@ -513,7 +642,7 @@ def ask_llm(user_input, store, system_extra=""):
         return json.dumps({"reply": "Limite diario del LLM alcanzado.", "plan": [], "alternatives": []})
     inc_usage(store, "call")
     try:
-        return call_llm(user_input, build_system_prompt(store, system_extra))
+        return call_llm(user_input, build_system_prompt(user_input, store, system_extra))
     except Exception as e:
         return json.dumps({"reply": f"Error API: {e}", "plan": [], "alternatives": []})
 
@@ -527,6 +656,43 @@ def parse_json_loose(raw):
         return json.loads(m.group(0))
     except Exception:
         return None
+
+
+MAX_SEARCH_CHARS = 600   # coto duro anti-explosion de tokens
+MAX_RESULTS = 3
+
+
+def web_search(query):
+    """Busqueda web quirurgica via DuckDuckGo Lite (HTML minimo, sin API key).
+    Devuelve maximo 3 resultados y 600 caracteres en total: titulo + snippet corto."""
+    try:
+        r = requests.post("https://lite.duckduckgo.com/lite/", data={"q": query[:200]},
+                          headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"},
+                          timeout=15)
+        links = re.findall(r'<a[^>]+href="(http[^"]+)"[^>]*>(.*?)</a>', r.text)
+        snips = [re.sub(r"<[^>]+>", "", s).strip()
+                 for s in re.findall(r'class=["\']result-snippet["\'][^>]*>(.*?)</td>',
+                                     r.text, re.DOTALL)]
+        out, total = [], 0
+        si = 0
+        for url, raw_title in links:
+            title = re.sub(r"<[^>]+>", "", raw_title).strip()
+            if not title or "duckduckgo" in url:
+                continue
+            snippet = ""
+            if si < len(snips):
+                snippet = snips[si]
+                si += 1
+            piece = f"- {title}: {snippet} [{url}]"
+            if len(piece) > MAX_SEARCH_CHARS - total:
+                break
+            out.append(piece)
+            total += len(piece)
+            if len(out) >= MAX_RESULTS:
+                break
+        return "\n".join(out) if out else "(sin resultados utiles)"
+    except Exception as e:
+        return f"[busqueda fallo: {e}]"
 
 
 def critic_loop(store, task, results):
@@ -643,6 +809,20 @@ def handle_turn(user_input, store):
     """
     raw = ask_llm(user_input, store)
     data = parse_json_loose(raw) or {"plan": [], "reply": "", "alternatives": []}
+
+    # Herramienta de busqueda web: si el modelo la pide, se ejecuta UNA vez,
+    # se inyectan los resultados recortados y se hace una sola pasada final.
+    if isinstance(data.get("search"), str) and data["search"].strip():
+        results = web_search(data["search"].strip())
+        raw2 = ask_llm(
+            user_input, store,
+            f"RESULTADOS DE BUSQUEDA WEB para '{data['search'][:80]}' (recortados, "
+            f"verifica vigencia antes de afirmar):\n{results}\n"
+            "Con esto respondé el JSON final. NO vuelvas a pedir search.")
+        data2 = parse_json_loose(raw2)
+        if data2:
+            data = data2
+
     out = []
     extract_actions(data, store, out)
 
@@ -769,6 +949,7 @@ def dispatch(text, store):
     """Comandos locales. Devuelve (True, salida) | ('mision', goal) | (False, None)."""
     if text == "/help":
         return True, ("/help /status /recursos /memoria /errors /skills /skill save|test|run|del <nombre> "
+                      "/nota <texto> /notas /idea <texto> /ideas "
                       "/mision <objetivo> /misiones /auto on|off /stopauto /resetauto /restart\n"
                       f"Misiones: max {CFG['mission_max_steps']} pasos. "
                       f"Limites: {CFG['max_calls_per_day']} calls/dia, {CFG['max_auto_cycles_per_day']} auto/dia.")
@@ -789,6 +970,23 @@ def dispatch(text, store):
     if text == "/memoria":
         facts = store.facts(20)
         return True, "\n".join(facts) or "(vacia)"
+
+    if text.startswith("/nota ") or text.startswith("/idea "):
+        kind = "notas" if text.startswith("/nota ") else "ideas"
+        entry = {"ts": now_iso(), "text": text.split(" ", 1)[1].strip()[:300]}
+        if not entry["text"]:
+            return True, f"uso: /{kind[:-1]} <texto>"
+        lst = store.get(kind, [])
+        lst.append(entry)
+        lst = lst[-50:]
+        store.set(kind, lst)
+        return True, f"{kind[:-1]} guardada (total {len(lst)})"
+
+    if text in ("/notas", "/ideas"):
+        kind = "notas" if text == "/notas" else "ideas"
+        lst = store.get(kind, [])[-10:]
+        return True, ("\n".join(f"{e['ts'][:16]} {e['text']}" for e in reversed(lst))
+                      or "(vacio)")
 
     if text == "/errors":
         errs = [f"{e[0][:19]} {e[1]}: {e[2][:80]}" for e in store.recent_errors(10)]
@@ -856,11 +1054,56 @@ def dispatch(text, store):
 # === 12. DAEMONS (TELEGRAM + AUTO-CICLOS) ====================================
 # ==============================================================================
 
+def compress_memory(store):
+    """Compresion nocturna de memoria: UNA llamada LLM para consolidar hechos
+    duplicados/obsoletos. Guarda backup previo en kv y no aplica nada si la
+    respuesta no parsea bien."""
+    rows = store.all_facts(120)
+    if len(rows) < 10:
+        return "pocas facts, nada que consolidar"
+    old_texts = [r[2] for r in rows]
+    facts_text = "\n".join(f"- {t}" for t in old_texts)
+    prompt = (
+        "[COMPRESION DE MEMORIA] Hechos acumulados:\n"
+        f"{facts_text}\n\n"
+        "Devolveme SOLO un array JSON consolidando estos hechos EXISTENTES: fusiona duplicados "
+        "textualmente, elimina solo lo obsoleto o trivial, maximo 40 items, cada uno breve. "
+        "PROHIBIDO inventar, agregar o reformular datos que no esten en la lista de arriba. "
+        'Formato exacto: ["hecho 1", "hecho 2", ...]'
+    )
+    raw = ask_llm(prompt, store, "Modo mantenimiento nocturno: responde SOLO el array JSON.")
+    m = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not m:
+        return "respuesta no parseable: no cambio nada"
+    try:
+        new_facts = json.loads(m.group(0))
+        if not isinstance(new_facts, list) or not new_facts or len(new_facts) > 60:
+            return "lista invalida: no cambio nada"
+        clean = [str(x).strip()[:500] for x in new_facts if str(x).strip()]
+        store.set("facts_backup_" + datetime.date.today().isoformat(),
+                  {"ids": [r[0] for r in rows], "ts": [r[1] for r in rows], "texts": old_texts})
+        store.replace_facts(clean)
+        return f"memoria consolidada: {len(rows)} -> {len(clean)} facts (backup en kv)"
+    except Exception as e:
+        return f"error en consolidacion: {e} (no cambio nada)"
+
+
 def auto_worker(store):
-    """Hilo de auto-mejora: cada N segundos hace UN ciclo util si hay presupuesto y recursos."""
+    """Hilo de fondo: rutina nocturna 04:00 (compresion de memoria) y
+    auto-mejora cada N segundos si hay presupuesto y recursos."""
     while True:
         time.sleep(CFG["auto_interval_sec"])
         try:
+            # --- rutina nocturna (una vez por dia, a las 04:00) ---
+            now = datetime.datetime.now()
+            today = now.date().isoformat()
+            if now.hour == 4 and store.get("last_compress") != today:
+                store.set("last_compress", today)
+                if not circuit_open(store) and resources_ok() and check_budget(store, "call"):
+                    r = compress_memory(store)
+                    log.info("compresion nocturna: %s", r)
+                    tg_send(f"[MANTENIMIENTO] {r}")
+
             if not store.get("auto"):
                 continue
             if circuit_open(store):
@@ -884,23 +1127,26 @@ def auto_worker(store):
             record_error(store, "auto_worker", e)
 
 
+_LOCK_FD = None
+
+
 def acquire_lock():
-    """Garantiza instancia unica via PID lock."""
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)
-            print(f"microbot ya corriendo (pid {pid}).", file=sys.stderr)
-            sys.exit(1)
-        except (ProcessLookupError, ValueError, PermissionError):
-            pass
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    """Garantiza instancia unica via flock sobre el PID file (robusto ante PIDs reciclados)."""
+    global _LOCK_FD
+    _LOCK_FD = open(PID_FILE, "w")
+    try:
+        fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("microbot ya corriendo (lock activo).", file=sys.stderr)
+        sys.exit(1)
+    _LOCK_FD.write(str(os.getpid()))
+    _LOCK_FD.flush()
 
 
 def release_lock():
     try:
+        if _LOCK_FD:
+            _LOCK_FD.close()
         os.remove(PID_FILE)
     except OSError:
         pass
@@ -910,7 +1156,7 @@ def telegram_daemon():
     store = Store(DB_FILE)
     acquire_lock()
     threading.Thread(target=auto_worker, args=(store,), daemon=True).start()
-    tg_send(f"MicroBot v7.0.0 online.\n{get_sys_stats()['str']}\nMulti-respuesta activa. /help")
+    tg_send(f"MicroBot v7.1.0 online.\n{get_sys_stats()['str']}\nMulti-respuesta activa. /help")
     log.info("daemon iniciado (pid %s)", os.getpid())
     last_update = 0
     try:
@@ -991,6 +1237,8 @@ def cli():
     arg = " ".join(sys.argv[1:])
     if arg in ("--daemon", "-d"):
         telegram_daemon()
+    elif arg == "--compactar":
+        print(compress_memory(store))
     elif arg in ("--help", "-h"):
         print("microbot [msg] | --daemon | --status | --help")
     elif arg == "--status":

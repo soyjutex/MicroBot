@@ -1,5 +1,11 @@
 # 🤖 MicroBot
 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![RAM Footprint](https://img.shields.io/badge/RAM_Idle-~22MB-brightgreen.svg)]
+[![Monthly Cost](https://img.shields.io/badge/Cost-%240%2Fmonth-success.svg)]
+[![Hardware](https://img.shields.io/badge/Tested_on-Pentium_2008-orange.svg)]
+
 > **Autonomous Edge AI Agent & Linux SysAdmin in a single Python file.**
 > *Zero-bloat. Self-healing. Built for low-spec hardware (~22MB RAM footprint).*
 
@@ -18,11 +24,28 @@ Agente autónomo de administración de sistemas que vive en una notebook vieja c
 - **Ciclo cerrado**: PENSAR → ACTUAR → OBSERVAR → CRITICAR → APRENDER en cada turno.
 - **Multi-respuesta**: además de la respuesta principal, genera hasta 2 variantes útiles (otra forma de resolverlo, sugerencia de mantenimiento, dato relacionado).
 - **Misiones multi-paso**: `/mision <objetivo>` lanza un bucle agente con corte anti-bucle y pausa inteligente ante falta de permisos o recursos.
-- **Memoria persistente unificada** en SQLite: facts, historial, errores, misiones, skills y preferencias.
+- **Memoria persistente unificada** en SQLite con **búsqueda semántica FTS5**: cada turno inyecta al LLM solo los 3-5 hechos relevantes al mensaje (zero-token bloat), no todo el historial.
+- **Búsqueda web quirúrgica**: el modelo puede pedir búsquedas reales (DuckDuckGo Lite) con coto duro de 3 resultados / 600 caracteres anti-explosión de tokens.
+- **Compresión nocturna**: a las 04:00 consolida hechos duplicados u obsoletos con UNA llamada LLM, con backup previo automático (nada se pierde).
 - **Skills Python reutilizables**: el bot puede crear funciones propias, validadas con `ast.parse` y testeadas automáticamente antes de guardarse.
 - **Presupuesto diario** de llamadas API con alertas al 70%/90% y circuit breaker anti-cascada de errores.
 - **Consciencia de hardware**: lee `/proc` y temperatura; se auto-pausa si la RAM baja o la carga sube (ideal para hardware humilde).
 - **Seguridad por capas**: credenciales fuera del código (`config.json`, chmod 600), lista `BLOCKED` de comandos destructivos, único chat autorizado, instancia única por PID lock.
+
+### 🥊 ¿Por qué MicroBot vs Otros Frameworks?
+
+| Característica | MicroBot | AutoGPT / CrewAI / LangChain |
+| :--- | :---: | :---: |
+| **Consumo de RAM** | **~22 MB** | 400 MB - 2 GB+ |
+| **Complejidad** | **1 script Python** | Docenas de dependencias y Docker |
+| **Hardware mínimo** | **Pentium 2008 / 512MB RAM** | CPUs modernas / 8GB+ RAM |
+| **Costo Operativo** | **$0.00 / mes** | Requiere planes pagos o APIs costosas |
+| **Curva de instalación** | **1 comando (`install.sh`)** | Alta (Entornos virtuales, contenedores) |
+
+### 📸 Capturas
+
+> *GIF de una `/mision` ejecutándose paso a paso y respuesta con variantes — [pendiente capturar desde Telegram].*
+> Mientras tanto podés ver el dashboard en vivo: `http://IP-DEL-SERVIDOR:8080` (CPU/RAM/temp + memoria del bot).
 
 ## Requisitos
 
@@ -47,7 +70,32 @@ sudo bash install/install.sh
 
 El instalador: copia el código a `/opt/microbot/`, migra memoria vieja si existe (`~/.bot_memory.json` o `~/.nexus_brain.db`), instala el servicio systemd **root** (`microbot.service`) y crea el comando global `microbot`.
 
-> ¿Prefieres correrlo como usuario normal sin root? Cambia `User=root` por tu usuario en `install/microbot.service` antes de instalar. El bot funciona igual; solo perderá acceso a operaciones de sistema protegidas.
+> **¿Sin systemd?** (macOS, BSD, contenedores, servidores sin root) Ejecución directa en background:
+> ```bash
+> nohup python3 bot.py --daemon > /dev/null 2>&1 &
+> ```
+
+### 🔌 Multi-proveedor LLM (agnóstico)
+
+MicroBot funciona con **cualquier API compatible OpenAI** — solo cambiás `base_url` y `model` en `config.json`, sin tocar código:
+
+| Proveedor | `base_url` | `model` |
+|---|---|---|
+| OpenRouter (gratis, default) | `https://openrouter.ai/api/v1` | `openrouter/free` |
+| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
+| Ollama local (sin key) | `http://localhost:11434/v1` | `llama3.2` |
+| Gemini directo | — | `provider: "gemini"` |
+
+### 🔐 Configuración por variables de entorno
+
+Toda clave de `config.json` puede sobreescribirse con variables de entorno `MICROBOT_*` — ideal para Docker, Kubernetes o VPS efímeros:
+
+```bash
+MICROBOT_API_KEY=sk-or-v1-... \
+MICROBOT_TELEGRAM_TOKEN=123:abc \
+MICROBOT_CHAT_ID=456 \
+python3 bot.py --daemon
+```
 
 ## Uso
 
@@ -56,11 +104,13 @@ El instalador: copia el código a `/opt/microbot/`, migra memoria vieja si exist
 microbot                        # chat interactivo
 microbot "cuánta RAM libre?"    # consulta puntual (responde + variantes)
 microbot --status               # presupuesto y estado del breaker
+microbot --compactar            # fuerza la compresión de memoria (lo mismo que hace a las 04:00)
 ```
 
 **Dentro del chat interactivo / Telegram:**
 ```
 /help /status /recursos /memoria /errors /skills /misiones
+/nota <texto> /notas /idea <texto> /ideas    # notas locales, zero-API
 /mision <objetivo>           # tarea multi-paso con bucle agente
 /skill save|test|run|del <nombre>
 /auto on|off                 # bucle de auto-mejora cada 30 min
@@ -72,6 +122,8 @@ microbot --status               # presupuesto y estado del breaker
 systemctl status microbot       # estado del servicio
 journalctl -u microbot -f       # logs en vivo
 ```
+
+**Dashboard:** abrí `http://IP-DEL-SERVIDOR:8080` — CPU/RAM/disco/temperatura en vivo, memoria del bot (hechos, conversaciones, errores, skills) y cola del log. Solo lectura, sin frameworks, datos reales de SQLite y `/proc`.
 
 ## Multi-respuesta (v7)
 
@@ -100,8 +152,8 @@ Las variantes son opcionales para el modelo: solo aparecen cuando aportan valor 
 │   ├── microbot.service    # unidad systemd
 │   └── migrate_memory.py   # migrador JSON+SQLite-viejo → SQLite v7
 ├── dashboard/              # dashboard web simple (CPU/RAM/temp/logs)
-│   ├── dashboard.html
-│   └── stats_collector.py
+│   ├── dashboard.html      # interfaz (HTML+CSS+JS puro, sin frameworks)
+│   └── server.py           # servidor stdlib de solo lectura, puerto 8080
 └── docs/                   # historia, protocolos de mantenimiento y bitácoras
 ```
 
@@ -110,6 +162,7 @@ En runtime (servidor):
 /opt/microbot/
 ├── bot.py                  # código
 ├── config.json             # credenciales (chmod 600, nunca en git)
+├── dashboard/              # dashboard web (servido en :8080)
 └── data/
     ├── microbot.db         # memoria SQLite unificada
     └── microbot.log        # log propio

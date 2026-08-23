@@ -1,67 +1,89 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-    <meta charset="UTF-8">
-    <title>Server Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { background: #000; color: #00ff41; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin: 0; padding: 20px; }
-        .dashboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; width: 100%; max-width: 1000px; }
-        .card { border: 1px solid #00ff41; padding: 20px; background: #080808; }
-        .metric { font-size: 24px; font-weight: bold; margin: 10px 0; }
-        canvas { width: 100% !important; height: 150px !important; }
-        button { background: #00ff41; color: #000; border: none; padding: 10px; cursor: pointer; font-weight: bold; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MicroBot</title>
+<style>
+  :root{--bg:#0b0e14;--card:#141922;--line:#232a36;--txt:#e6e9ef;--mut:#8b94a7}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:32px;max-width:900px;margin:0 auto}
+  header{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:24px}
+  h1{font-size:18px;font-weight:600}h1 span{color:var(--mut);font-weight:400}
+  #upd{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+  .v{font-size:26px;font-weight:600;margin-top:4px}.v small{font-size:13px;color:var(--mut)}
+  section{margin-bottom:20px}
+  h2{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
+  ul{list-style:none}
+  .row{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:6px;display:flex;gap:14px;font-size:14px}
+  .row time{color:var(--mut);flex-shrink:0;font-size:12px;padding-top:2px}
+  .empty{color:var(--mut);font-size:13px}
+  pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;font-size:12px;overflow-x:auto;color:#9aa4b8;white-space:pre-wrap;word-break:break-word}
+  footer{margin-top:8px;color:var(--mut);font-size:12px;text-align:center}
+</style>
 </head>
 <body>
-    <div class="dashboard">
-        <div class="card"><h3>CPU & RAM History</h3><canvas id="chart"></canvas></div>
-        <div class="card"><h3>Disco</h3><div class="metric" id="disk">0%</div></div>
-        <div class="card"><h3>Temp CPU</h3><div class="metric" id="temp">0 C</div></div>
-        <div class="card"><h3>Acciones</h3><button onclick="downloadCSV()">Descargar Historico (CSV)</button></div>
-        <div class="card"><h3>System Logs</h3><pre id="sys-log" style="font-size: 10px;"></pre></div>
-        <div class="card"><h3>Bot Logs</h3><pre id="bot-log" style="font-size: 10px;"></pre></div>
-    </div>
-    <script>
-        const ctx = document.getElementById('chart').getContext('2d');
-        const chart = new Chart(ctx, {
-            type: 'line',
-            data: { labels: [], datasets: [{label: 'CPU %', data: [], borderColor: '#0f0'}, {label: 'RAM %', data: [], borderColor: '#00f'}] },
-            options: { responsive: true, scales: { y: { beginAtZero: true, max: 100 } } }
-        });
+<header>
+  <h1>MicroBot <span>/ dashboard</span></h1>
+  <span id="upd"></span>
+</header>
 
-        async function downloadCSV() {
-            const res = await fetch('history.csv');
-            const blob = await res.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'historico_servidor.csv';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        }
+<div class="grid">
+  <div class="card"><div class="k">CPU</div><div class="v" id="cpu">&ndash;</div></div>
+  <div class="card"><div class="k">RAM</div><div class="v" id="ram">&ndash;</div></div>
+  <div class="card"><div class="k">Disco</div><div class="v" id="disk">&ndash;</div></div>
+  <div class="card"><div class="k">Temp</div><div class="v" id="temp">&ndash;</div></div>
+</div>
 
-        async function update() {
-            const res = await fetch('stats.json?t=' + new Date().getTime());
-            const data = await res.json();
-            document.getElementById('disk').innerText = data.disk + '%';
-            document.getElementById('temp').innerText = data.temp + ' C';
-            
-            const now = new Date().toLocaleTimeString();
-            if (chart.data.labels.length > 20) { 
-                chart.data.labels.shift(); 
-                chart.data.datasets.forEach(d => d.data.shift()); 
-            }
-            chart.data.labels.push(now);
-            chart.data.datasets[0].data.push(data.cpu);
-            chart.data.datasets[1].data.push(data.ram);
-            chart.update();
+<div class="grid">
+  <div class="card"><div class="k">Hechos aprendidos</div><div class="v" id="n_facts">&ndash;</div></div>
+  <div class="card"><div class="k">Conversaciones</div><div class="v" id="n_history">&ndash;</div></div>
+  <div class="card"><div class="k">Errores</div><div class="v" id="n_errors">&ndash;</div></div>
+  <div class="card"><div class="k">Skills</div><div class="v" id="n_skills">&ndash;</div></div>
+</div>
 
-            document.getElementById('sys-log').innerText = data.sys_log;
-            document.getElementById('bot-log').innerText = data.bot_log;
-        }
-        setInterval(update, 2000);
-    </script>
+<section><h2>Ultimos hechos</h2><ul id="facts"><li class="empty">cargando...</li></ul></section>
+<section><h2>Errores recientes</h2><ul id="errors"><li class="empty">cargando...</li></ul></section>
+<section><h2>Log del bot</h2><pre id="log">&ndash;</pre></section>
+
+<footer>MicroBot &middot; datos reales de SQLite y /proc</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
+const cut = ts => esc(String(ts || "").slice(5, 16));
+
+async function refresh(){
+  try{
+    const s = await (await fetch("/api/stats")).json();
+    $("cpu").textContent = s.cpu != null ? s.cpu + "%" : "-";
+    $("ram").textContent = s.ram != null ? s.ram + "%" : "-";
+    $("disk").textContent = s.disk != null ? s.disk + "%" : "-";
+    $("temp").innerHTML = s.temp != null ? s.temp + "<small>&deg;C</small>" : "-";
+    $("upd").textContent = "actualizado " + new Date().toLocaleTimeString();
+  }catch(e){}
+
+  try{
+    const b = await (await fetch("/api/bot")).json();
+    $("n_facts").textContent = b.facts;
+    $("n_history").textContent = b.history;
+    $("n_errors").textContent = b.errors;
+    $("n_skills").textContent = b.skills;
+    $("facts").innerHTML = b.recent_facts.length
+      ? b.recent_facts.map(f => `<li class="row"><time>${cut(f.ts)}</time>${esc(f.text)}</li>`).join("")
+      : `<li class="empty">sin hechos todavia</li>`;
+    $("errors").innerHTML = b.recent_errors.length
+      ? b.recent_errors.map(e => `<li class="row"><time>${cut(e.ts)}</time><span>${esc(e.ctx)}: ${esc(e.err)}</span></li>`).join("")
+      : `<li class="empty">sin errores registrados</li>`;
+    $("log").textContent = (b.log || []).join("");
+  }catch(e){}
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
 </body>
 </html>
