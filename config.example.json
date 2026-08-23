@@ -1,0 +1,24 @@
+{
+    "_comentario": "Copia este archivo como config.json y completa tus credenciales. NUNCA subas config.json al repositorio. Key gratis en https://openrouter.ai/keys",
+
+    "api_key": "",
+    "provider": "openrouter",
+    "model": "openrouter/free",
+    "telegram_token": "",
+    "chat_id": "",
+
+    "max_calls_per_day": 45,
+    "max_auto_cycles_per_day": 6,
+    "auto_interval_sec": 1800,
+    "cmd_timeout_sec": 60,
+
+    "error_threshold": 0.5,
+    "min_errors_for_breaker": 3,
+    "backoff_base_sec": 3600,
+
+    "mission_max_steps": 6,
+    "ram_min_mb": 150,
+    "load_max": 4.0,
+
+    "max_alternatives": 2
+}

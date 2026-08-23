@@ -1,0 +1,36 @@
+# --- Secretos y configuracion local (NUNCA subir al repo) ---
+config.json
+*.key
+*.token
+secrets/
+.env
+.env.*
+
+# --- Datos de runtime del bot ---
+*.db
+*.db-journal
+.bot_memory.json
+.bot_memory.json.tmp
+*.log
+*.pid
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# --- Scripts locales de mantenimiento con credenciales ---
+_local/
+
+# --- Sistema / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.bak*
+.tmp.driveupload/
+
+# material privado con credenciales - jamas versionar
+privado/

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Server Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background: #000; color: #00ff41; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin: 0; padding: 20px; }
+        .dashboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; width: 100%; max-width: 1000px; }
+        .card { border: 1px solid #00ff41; padding: 20px; background: #080808; }
+        .metric { font-size: 24px; font-weight: bold; margin: 10px 0; }
+        canvas { width: 100% !important; height: 150px !important; }
+        button { background: #00ff41; color: #000; border: none; padding: 10px; cursor: pointer; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <div class="card"><h3>CPU & RAM History</h3><canvas id="chart"></canvas></div>
+        <div class="card"><h3>Disco</h3><div class="metric" id="disk">0%</div></div>
+        <div class="card"><h3>Temp CPU</h3><div class="metric" id="temp">0 C</div></div>
+        <div class="card"><h3>Acciones</h3><button onclick="downloadCSV()">Descargar Historico (CSV)</button></div>
+        <div class="card"><h3>System Logs</h3><pre id="sys-log" style="font-size: 10px;"></pre></div>
+        <div class="card"><h3>Bot Logs</h3><pre id="bot-log" style="font-size: 10px;"></pre></div>
+    </div>
+    <script>
+        const ctx = document.getElementById('chart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: { labels: [], datasets: [{label: 'CPU %', data: [], borderColor: '#0f0'}, {label: 'RAM %', data: [], borderColor: '#00f'}] },
+            options: { responsive: true, scales: { y: { beginAtZero: true, max: 100 } } }
+        });
+
+        async function downloadCSV() {
+            const res = await fetch('history.csv');
+            const blob = await res.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'historico_servidor.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        async function update() {
+            const res = await fetch('stats.json?t=' + new Date().getTime());
+            const data = await res.json();
+            document.getElementById('disk').innerText = data.disk + '%';
+            document.getElementById('temp').innerText = data.temp + ' C';
+            
+            const now = new Date().toLocaleTimeString();
+            if (chart.data.labels.length > 20) { 
+                chart.data.labels.shift(); 
+                chart.data.datasets.forEach(d => d.data.shift()); 
+            }
+            chart.data.labels.push(now);
+            chart.data.datasets[0].data.push(data.cpu);
+            chart.data.datasets[1].data.push(data.ram);
+            chart.update();
+
+            document.getElementById('sys-log').innerText = data.sys_log;
+            document.getElementById('bot-log').innerText = data.bot_log;
+        }
+        setInterval(update, 2000);
+    </script>
+</body>
+</html>

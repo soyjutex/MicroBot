@@ -1,0 +1,21 @@
+[Unit]
+Description=MicroBot - Agente autonomo de administracion de sistemas
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/microbot
+ExecStart=/usr/bin/python3 /opt/microbot/bot.py --daemon
+Restart=always
+RestartSec=5
+
+# Endurecimiento basico: el bot es root por diseno (caja dedicada),
+# pero limitamos lo que el kernel le permite hacer al proceso.
+NoNewPrivileges=false
+ProtectHome=read-only
+ReadWritePaths=/opt/microbot /tmp
+
+[Install]
+WantedBy=multi-user.target
