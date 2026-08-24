@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Harness offline — 20 checks, sin red ni API."""
+import os, sys, tempfile, json, sqlite3
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bot
+
+RES = []
+
+def chk(name, fn):
+    try:
+        fn()
+        RES.append((name, True, ""))
+        print(f"  [OK] {name}")
+    except Exception as e:
+        RES.append((name, False, str(e)))
+        print(f"  [FAIL] {name}: {e}")
+
+# PAL
+def t_telemetry():
+    t = bot._telemetry()
+    assert isinstance(t, dict) and t["ram_total_mb"] > 0
+
+def t_get_stats():
+    s = bot.get_stats()
+    assert "RAM=" in s["str"]
+
+def t_resources_ok():
+    assert isinstance(bot.resources_ok(), bool)
+
+# SECURITY
+def t_blocked():
+    bad = "format c:" if bot.IS_WINDOWS else "rm -rf /"
+    assert "[BLOQUEADO]" in bot.run_cmd(bad)
+
+def t_run_cmd():
+    assert "hola" in bot.run_cmd("echo hola")
+
+# DB / FTS5
+def t_store_roundtrip():
+    db = os.path.join(tempfile.mkdtemp(), "t.db")
+    bot.DB_FILE = db
+    bot.init_db()
+    bot.kv_set("k", {"n": 1})
+    assert bot.kv_get("k")["n"] == 1
+
+def t_fts():
+    db = os.path.join(tempfile.mkdtemp(), "t.db")
+    bot.DB_FILE = db
+    bot.init_db()
+    bot.add_fact("La impresora es Epson LX-350")
+    facts = bot.search_facts("impresora taller")
+    assert any("Epson" in f for f in facts)
+
+def t_history():
+    db = os.path.join(tempfile.mkdtemp(), "t.db")
+    bot.DB_FILE = db
+    bot.init_db()
+    bot.add_history("p", "r")
+    row = bot.db().execute("SELECT user, bot FROM history ORDER BY id DESC LIMIT 1").fetchone()
+    assert tuple(row) == ("p", "r")
+
+# BUDGET / OUTBOX
+def t_budget():
+    db = os.path.join(tempfile.mkdtemp(), "t.db")
+    bot.DB_FILE = db; bot.CFG["max_calls_day"] = 1
+    bot.init_db()
+    assert bot.budget_ok()
+    bot.inc_budget()
+    assert not bot.budget_ok()
+
+def t_outbox():
+    db = os.path.join(tempfile.mkdtemp(), "t.db")
+    bot.DB_FILE = db; bot.init_db()
+    bot.outbox_add("test")
+    rows = bot.db().execute("SELECT text FROM outbox").fetchall()
+    assert len(rows) == 1
+
+# JSON / PARSE
+def t_parse_fences():
+    raw = '```json\n{"reply":"ok","status":"SUCCESS"}\n```'
+    assert bot.parse_json(raw)["reply"] == "ok"
+
+def t_parse_prose():
+    raw = 'Claro! {"reply":"hi","status":"SUCCESS"} espero sirva'
+    assert bot.parse_json(raw)["reply"] == "hi"
+
+# STAGE MESSAGES
+def t_stages():
+    assert set(bot.STAGE.keys()) >= {"recv","think","search","exec"}
+
+# REACT HELPERS
+def t_react_action():
+    assert bot._extract_action({"plan":[{"cmd":"ls -la"}]}) == ("cmd", "ls -la")
+    assert bot._extract_action({"plan":["free -m"]}) == ("cmd", "free -m")
+    assert bot._extract_action({"search":"kernel debian 13"}) == ("search", "kernel debian 13")
+    assert bot._extract_action({"reply":"listo"}) is None
+    assert bot._extract_action({"plan":[{"cmd":""}]}) is None
+    assert bot._extract_action({"plan":[{"cmd":" a "},{"cmd":"b"}]}) == ("cmd", "a")
+
+def t_react_msg():
+    m = bot._react_assistant_msg("pensando X", "cmd: free -m")
+    assert m["role"] == "assistant"
+    d = json.loads(m["content"])
+    assert d["thought"] == "pensando X" and d["action"] == "cmd: free -m"
+
+# SLASH COMMANDS
+def t_slash_shortcuts():
+    assert bot.dispatch("/disco")[0] is True
+    assert bot.dispatch("/ping")[0] is True
+
+def t_clear():
+    db = os.path.join(tempfile.mkdtemp(), "t.db")
+    bot.DB_FILE = db; bot.init_db()
+    bot.add_history("u", "b")
+    assert bot.dispatch("/clear")[0] is True
+    c = sqlite3.connect(db)
+    assert c.execute("SELECT COUNT(*) FROM history").fetchone()[0] == 0
+
+def t_chunk():
+    text = "a\n" * 2000
+    chunks = bot.tg_chunk(text, 100)
+    assert len(chunks) > 1
+    assert all(len(c) <= 100 for c in chunks)
+    assert "".join(chunks) == text
+
+# MISIONES via marcador dispatch -> handle_turn(max_substeps)
+def t_mission_dispatch():
+    kind, goal = bot.dispatch("/mision revisar logs del sistema")
+    assert kind == "mision" and goal == "revisar logs del sistema"
+    assert bot.dispatch("/mision") != "mision"  # sin objetivo no es mision
+
+# AIDER & OPENHANDS ARCHITECTURE TESTS
+def t_search_replace():
+    tmp = os.path.join(tempfile.mkdtemp(), "test.py")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("def foo():\n    return False\n")
+    diff = "<<<<<<< SEARCH\ndef foo():\n    return False\n=======\ndef foo():\n    return True\n>>>>>>> REPLACE"
+    res = bot.apply_search_replace(tmp, diff)
+    assert "ÉXITO" in res
+    with open(tmp, "r", encoding="utf-8") as f:
+        assert "return True" in f.read()
+
+def t_code_map_and_slice():
+    tmp = os.path.join(tempfile.mkdtemp(), "test_map.py")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("class Dummy:\n    def bar(self, x):\n        pass\n")
+    m = bot.get_code_map(tmp)
+    assert "Dummy" in m and "bar" in m
+    sl = bot.read_file_slice(tmp, 1, 3)
+    assert "class Dummy" in sl
+
+# SKILLS
+def t_skill():
+    db = os.path.join(tempfile.mkdtemp(), "t.db")
+    bot.DB_FILE = db; bot.init_db()
+    code = "def run(arg):\n    return (arg or '').upper()\n"
+    assert "GUARDADA" in bot.install_skill("mayus", code)
+    assert "HOLA" in bot.run_skill("mayus", "hola")
+
+def t_validate_bad():
+    ok, _ = bot.validate_code("esto no es python ((((")
+    assert not ok
+
+# LOCK
+def t_lock():
+    import io
+    old = bot.PID_FILE
+    bot.PID_FILE = os.path.join(tempfile.mkdtemp(), "lock.pid")
+    old_err = sys.stderr; sys.stderr = io.StringIO()
+    try:
+        l1 = bot.InstanceLock(); l1.acquire()
+        try:
+            bot.InstanceLock().acquire()
+            raise AssertionError("debe fallar")
+        except SystemExit: pass
+        finally: l1.release()
+    finally:
+        sys.stderr = sys.__stderr__; bot.PID_FILE = old
+
+if __name__ == "__main__":
+    try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except: pass
+    so = "Windows" if bot.IS_WINDOWS else ("macOS" if bot.IS_MACOS else "Linux")
+    print(f"HARNESS MicroBot v8 sobre {so}")
+    print("-"*50)
+    for n, f in sorted([(n, f) for n, f in globals().items() if n.startswith("t_")], key=lambda x: x[0]):
+        chk(n[2:], f)
+    print("-"*50)
+    ok = sum(1 for _, p, _ in RES if p)
+    print(f"{ok}/{len(RES)} passed | {so}")
+    sys.exit(0 if ok == len(RES) else 1)
