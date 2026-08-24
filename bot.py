@@ -19,7 +19,9 @@ IS_WINDOWS = OS_NAME == "Windows"
 IS_MACOS = OS_NAME == "Darwin"
 IS_LINUX = OS_NAME == "Linux"
 
-BASE_DIR = os.getenv("MICROBOT_DATA_DIR", os.path.expanduser("~/.microbot"))
+# Datos y config viven junto al script: una carpeta = instalacion completa.
+# Override opcional con MICROBOT_DATA_DIR (p.ej. systemd con sandbox).
+BASE_DIR = os.getenv("MICROBOT_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(BASE_DIR, exist_ok=True)
 DB_FILE = os.path.join(BASE_DIR, "microbot.db")
 PID_FILE = os.path.join(tempfile.gettempdir(), "microbot.pid")
@@ -143,10 +145,10 @@ class InstanceLock:
 # =====================================================================
 def load_config():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    cfg_file = os.getenv("MICROBOT_CONFIG", os.path.join(BASE_DIR, "config.json"))
-    # También busca junto al script (para desarrollo local)
+    cfg_file = os.getenv("MICROBOT_CONFIG", os.path.join(script_dir, "config.json"))
+    # Fallback legacy: ~/.microbot/config.json
     if not os.path.exists(cfg_file):
-        alt = os.path.join(script_dir, "config.json")
+        alt = os.path.join(os.path.expanduser("~/.microbot"), "config.json")
         if os.path.exists(alt): cfg_file = alt
     file_cfg = {}
     if os.path.exists(cfg_file):
@@ -175,6 +177,8 @@ CFG = load_config()
 # =====================================================================
 def init_db():
     with sqlite3.connect(DB_FILE) as c:
+        c.execute("PRAGMA journal_mode=WAL;")   # Write-Ahead Logging: lecturas concurrentes sin esperas
+        c.execute("PRAGMA busy_timeout=5000;")  # espera hasta 5s en vez de fallar con 'database is locked'
         c.executescript("""
         CREATE TABLE IF NOT EXISTS facts (id INTEGER PRIMARY KEY, fact TEXT UNIQUE, ts TEXT);
         CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(fact, content='facts', content_rowid='id');
@@ -186,6 +190,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, code TEXT, desc TEXT, ts TEXT);
         CREATE TABLE IF NOT EXISTS usage (date TEXT PRIMARY KEY, calls INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY, text TEXT, ts TEXT);
+        CREATE TABLE IF NOT EXISTS schedules (id INTEGER PRIMARY KEY, schedule_time TEXT, task TEXT, daily INTEGER DEFAULT 0, last_run TEXT);
         """)
         c.commit()
 
