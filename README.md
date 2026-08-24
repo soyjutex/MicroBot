@@ -2,14 +2,20 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![RAM Footprint](https://img.shields.io/badge/RAM_Idle-~22MB-brightgreen.svg)]
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)]
+[![RAM Footprint](https://img.shields.io/badge/RAM_Idle-~40MB-brightgreen.svg)]
 [![Monthly Cost](https://img.shields.io/badge/Cost-%240%2Fmonth-success.svg)]
 [![Hardware](https://img.shields.io/badge/Tested_on-Pentium_2008-orange.svg)]
 
-> **Autonomous Edge AI Agent & Linux SysAdmin in a single Python file.**
-> *Zero-bloat. Self-healing. Built for low-spec hardware (~22MB RAM footprint).*
+> **Autonomous Edge AI Agent & SysAdmin in a single Python file — Linux, Windows y macOS.**
+> *Zero-bloat. Self-healing. Built for low-spec hardware (~40MB RAM footprint).*
 
-Agente autónomo de administración de sistemas que vive en una notebook vieja convertida en servidor Linux dedicado. Se lo habla por **Telegram** o por **terminal**, entiende lenguaje natural vía **OpenRouter (tier Free)**, ejecuta comandos Linux, aprende de sus errores y mantiene memoria persistente. **Todo el proyecto corre con costo cero: $0 en APIs, $0 en infraestructura.**
+Agente autónomo de administración de sistemas **multiplataforma**: un único `bot.py` idéntico para cualquier OS (la PAL detecta el sistema al arrancar: telemetría nativa, bash o PowerShell como shell de planes, lock de instancia por OS). Se lo habla por **Telegram** o por **terminal**, entiende lenguaje natural vía **OpenRouter (tier Free)**, ejecuta comandos reales del sistema, aprende de sus errores y mantiene memoria persistente semántica. **Todo el proyecto corre con costo cero: $0 en APIs, $0 en infraestructura.**
+
+Incluye `test_harness.py`: batería de pruebas offline (17 checks) que valida PAL, memoria FTS5, seguridad y protocolo en cualquier OS sin red ni API.
+
+## v8 UNIVERSAL
+Hasta v7 el bot era Linux-only; desde **v8.0** el mismo archivo corre en Windows y macOS con todas las capacidades (misiones, critic, skills, compresión nocturna, outbox, pipeline visible). Verificado con 17/17 pruebas en Debian 13 y Windows 10 sobre el mismo código.
 
 ```
 [tú] ──Telegram──> MicroBot ──> OpenRouter/free (piensa + planifica en JSON)

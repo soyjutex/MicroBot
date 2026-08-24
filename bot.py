@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MicroBot v7.1.0 - Agente autonomo de administracion de sistemas para Telegram.
+MicroBot v8.0 UNIVERSAL - Agente autonomo multiplataforma (Linux / macOS / Windows).
+
+UN solo archivo con TODAS las capacidades, para CUALQUIER OS. La Capa de
+Abstraccion de Plataforma (PAL) detecta el sistema al arrancar y conecta
+telemetria, shell y lock nativos. El resto del cerebro es identico en todas
+las plataformas: misiones, critic, skills, compresion nocturna, outbox,
+pipeline visible y presupuesto cerrado.
 
 Caracteristicas principales:
-    - Cerebro LLM (OpenRouter Free, costo cero) con protocolo JSON estricto: piensa, planifica, ejecuta, critica y aprende.
+    - Cerebro LLM agnostico (OpenRouter/Groq/Gemini/Ollama) con protocolo JSON estricto: piensa, planifica, ejecuta, critica y aprende.
     - Memoria semantica: SQLite + FTS5 inyecta solo los hechos relevantes a cada mensaje (zero-token bloat).
-    - Busqueda web quirurgica opcional (DuckDuckGo Lite, max 3 resultados / 600 chars) y compresion nocturna de memoria a las 04:00.
-    - Multi-respuesta: ademas de la respuesta principal, ofrece hasta N alternativas.
+    - Busqueda web quirurgica opcional y compresion nocturna de memoria a las 04:00.
+    - Misiones multi-paso, critic loop, skills Python validadas, circuit breaker.
+    - Pipeline visible: burbuja de tipeo + mensaje de estado que se edita por capa real.
+    - Outbox: si la red falla, las respuestas se entregan al volver la conexion.
     - Memoria persistente unificada en SQLite (facts, historial, errores, misiones, skills).
-    - Misiones multi-paso con corte anti-bucle y pausa ante falta de permisos.
-    - Skills Python reutilizables con validacion sintactica y test automatico.
     - Presupuesto diario de llamadas API + circuit breaker anti-cascada de errores.
-    - Consciencia de hardware: auto-pausa si la RAM o la carga estan en limites.
+    - Consciencia de hardware: auto-pausa si la RAM o la CPU estan en limites.
 
 Seguridad:
     - Las credenciales viven en config.json (chmod 600), NUNCA en el codigo.
-    - Lista BLOCKED: comandos destructivos rechazados antes de ejecutarse.
+    - Lista BLOCKED por OS: comandos destructivos rechazados antes de ejecutarse.
     - Un solo chat de Telegram autorizado.
 
 Estructura del archivo (busca los marcadores "=== SECCION ==="):
@@ -37,10 +43,10 @@ Estructura del archivo (busca los marcadores "=== SECCION ==="):
 
 import ast
 import datetime
-import fcntl
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import socket
@@ -49,6 +55,11 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+if platform.system() == "Windows":
+    import msvcrt
+else:
+    import fcntl
 
 import requests
 
@@ -78,6 +89,7 @@ DEFAULTS = {
     "mission_max_steps": 6,
     "ram_min_mb": 150,
     "load_max": 4.0,
+    "cpu_max_pct": 85,                 # usado en Windows/macOS donde no hay loadavg
     "max_alternatives": 2,
 }
 
@@ -101,18 +113,24 @@ def load_config():
 
 CFG = load_config()
 
+store_global = None   # referencia global al Store activo (para tg_send/outbox)
+
 
 def now_iso():
     """Timestamp ISO local, usado en toda la memoria."""
     return datetime.datetime.now().isoformat()
 
 
-PID_FILE = "/tmp/microbot.pid"
+PID_FILE = os.path.join(DATA_DIR, "microbot.pid")
 SELF_FILE = os.path.abspath(__file__)
 
+IS_WINDOWS = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
+
 # Comandos que MicroBot nunca ejecuta, ni siquiera como root.
-BLOCKED = [
-    r"rm\s+-rf\s+/\b",
+BLOCKED_UNIX = [
+    r"rm\s+-[rf]{1,2}\s*/(?:\s|$)",    # rm -rf /  (con o sin flag invertida)
+    r"--no-preserve-root",
     r"mkfs",
     r"dd\s+if=",
     r":\(\)\s*\{\s*:\|\:&\s*;\s*\}",   # fork bomb
@@ -122,6 +140,18 @@ BLOCKED = [
     r">\s*/dev/sd",
     r"chmod\s+-R\s+777\s+/\b",
 ]
+BLOCKED_WINDOWS = [
+    r"format\s+[a-z]:",
+    r"\bdiskpart\b",
+    r"Remove-Item\s+[^|]*-[Rr]ecurse[^|]*-\s*[Ff]orce\s+[\"']?[a-zA-Z]:\\\s*\"?'?$",
+    r"\brd\s+/s\s+/q\s+[a-z]:\\\s*$",
+    r"\bdel\s+/[sf]\b.*[c-z]:\\\s*$",
+    r"\bshutdown\b",
+    r"\bbcdedit\b",
+    r"reg\s+delete\s+HKLM",
+    r"\bcipher\s+/w\b",
+]
+BLOCKED = BLOCKED_WINDOWS if IS_WINDOWS else BLOCKED_UNIX
 
 # ==============================================================================
 # === 2. LOGGING ===============================================================
@@ -147,6 +177,8 @@ class Store:
     def __init__(self, path):
         self.conn = sqlite3_connect(path)
         self._init_schema()
+        global store_global
+        store_global = self
 
     def _init_schema(self):
         c = self.conn.cursor()
@@ -375,80 +407,162 @@ def sqlite3_connect(path):
 
 
 # ==============================================================================
-# === 4. ESTADISTICAS DE SISTEMA ==============================================
+# === 4. ESTADISTICAS DE SISTEMA (PAL) =========================================
 # ==============================================================================
 
+def telemetry():
+    """Stats reales del sistema sin procesos pesados. Windows: ctypes Win32.
+    Linux/macOS: /proc y /sys. Nunca lanza excepciones."""
+    out = {"ram_free_mb": None, "ram_total_mb": None, "cpu_pct": None,
+           "temp_c": None, "disk_pct": None}
+    if IS_WINDOWS:
+        try:
+            import ctypes
+
+            class MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_uint64),
+                            ("ullAvailPhys", ctypes.c_uint64),
+                            ("ullTotalPageFile", ctypes.c_uint64),
+                            ("ullAvailPageFile", ctypes.c_uint64),
+                            ("ullTotalVirtual", ctypes.c_uint64),
+                            ("ullAvailVirtual", ctypes.c_uint64),
+                            ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+            st = MemStatus()
+            st.dwLength = ctypes.sizeof(MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                out["ram_total_mb"] = st.ullTotalPhys // 1048576
+                out["ram_free_mb"] = st.ullAvailPhys // 1048576
+        except Exception:
+            pass
+        try:
+            import ctypes
+
+            class FileTime(ctypes.Structure):
+                _fields_ = [("lo", ctypes.c_uint32), ("hi", ctypes.c_uint32)]
+
+            def ft_value(ft):
+                return (ft.hi << 32) + ft.lo
+
+            k32 = ctypes.windll.kernel32
+            idle1, kern1, user1 = FileTime(), FileTime(), FileTime()
+            k32.GetSystemTimes(ctypes.byref(idle1), ctypes.byref(kern1), ctypes.byref(user1))
+            time.sleep(0.25)
+            idle2, kern2, user2 = FileTime(), FileTime(), FileTime()
+            k32.GetSystemTimes(ctypes.byref(idle2), ctypes.byref(kern2), ctypes.byref(user2))
+            total = (ft_value(kern2) - ft_value(kern1)) + (ft_value(user2) - ft_value(user1))
+            busy = total - (ft_value(idle2) - ft_value(idle1))
+            out["cpu_pct"] = round(busy * 100 / total, 1) if total else None
+        except Exception:
+            pass
+    else:
+        try:
+            with open("/proc/meminfo") as f:
+                mi = {}
+                for line in f:
+                    k, _, v = line.partition(":")
+                    mi[k.strip()] = int(v.strip().split()[0])
+            out["ram_total_mb"] = mi.get("MemTotal", 0) // 1024
+            out["ram_free_mb"] = mi.get("MemAvailable", 0) // 1024
+        except Exception:
+            pass
+        try:
+            load1 = float(open("/proc/loadavg").read().split()[0])
+            ncpu = os.cpu_count() or 1
+            out["cpu_pct"] = min(round(load1 * 100 / ncpu, 1), 100)
+        except Exception:
+            pass
+        path = None if IS_MAC else "/sys/class/thermal/thermal_zone0/temp"
+        try:
+            if path and os.path.exists(path):
+                out["temp_c"] = round(int(open(path).read().strip()) / 1000, 1)
+        except Exception:
+            pass
+    try:
+        disk_root = os.environ.get("SystemDrive", "C:") + "\\" if IS_WINDOWS else DATA_DIR
+        st = os.statvfs(disk_root)
+        out["disk_pct"] = round((st.f_blocks - st.f_bfree) * 100 / st.f_blocks, 1)
+    except Exception:
+        pass
+    return out
+
+
 def get_sys_stats():
-    """Lee load, RAM y temperatura SIN procesos pesados (solo /proc y /sys)."""
-    stats = {"load1": 0.0, "ram_free": 0, "ram_total": 0, "temp": "?"}
-    try:
-        stats["load1"] = float(open("/proc/loadavg").read().split()[0])
-    except Exception:
-        pass
-    try:
-        mi = {}
-        for line in open("/proc/meminfo"):
-            k, _, v = line.partition(":")
-            mi[k.strip()] = int(v.strip().split()[0])
-        stats["ram_free"] = mi.get("MemAvailable", 0) // 1024
-        stats["ram_total"] = mi.get("MemTotal", 0) // 1024
-    except Exception:
-        pass
-    try:
-        stats["temp"] = f"{int(open('/sys/class/thermal/thermal_zone0/temp').read().strip()) / 1000:.0f}C"
-    except Exception:
-        pass
-    stats["str"] = (f"load={stats['load1']} ram={stats['ram_free']}MB libres "
-                    f"de {stats['ram_total']}MB temp={stats['temp']}")
-    return stats
+    """Dict con stats + string resumen (compatible con todo el codigo existente)."""
+    t = telemetry()
+    load1 = None
+    if not IS_WINDOWS:
+        try:
+            load1 = float(open("/proc/loadavg").read().split()[0])
+        except Exception:
+            pass
+    s = {
+        "cpu_pct": t["cpu_pct"],
+        "ram_free": t["ram_free_mb"] or 0,
+        "ram_total": t["ram_total_mb"] or 0,
+        "temp_c": t["temp_c"],
+        "disk_pct": t["disk_pct"],
+        "load1": load1,
+    }
+    parts = []
+    if t["cpu_pct"] is not None:
+        parts.append(f"cpu={t['cpu_pct']}%")
+    parts.append(f"ram={s['ram_free']}MB libres de {s['ram_total']}MB")
+    if t["temp_c"] is not None:
+        parts.append(f"temp={t['temp_c']}C")
+    if load1 is not None:
+        parts.append(f"load={load1}")
+    if t["disk_pct"] is not None:
+        parts.append(f"disco={t['disk_pct']}%")
+    s["str"] = " ".join(parts) or "stats no disponibles"
+    return s
 
 
 def resources_ok():
+    """Guardia de recursos: RAM minima y techo de CPU o load segun plataforma."""
     s = get_sys_stats()
-    return s["ram_free"] >= CFG["ram_min_mb"] and s["load1"] <= CFG["load_max"]
+    ram_ok = s["ram_free"] >= CFG["ram_min_mb"]
+    if s["cpu_pct"] is not None:
+        return ram_ok and s["cpu_pct"] <= CFG["cpu_max_pct"]
+    if s["load1"] is not None:
+        return ram_ok and s["load1"] <= CFG["load_max"]
+    return ram_ok
 
 
 _HOST_ID = None
 
 
 def host_identity():
-    """Identidad real del equipo donde corre: hostname, distro y CPU.
-    Leido en vivo para que MicroBot sea universal (sin hardcodear hardware)."""
+    """Identidad real del equipo: hostname, OS y CPU. Leida en vivo, sin hardcodear."""
     global _HOST_ID
     if _HOST_ID is None:
         host = socket.gethostname()
-        os_name = ""
-        cpu = ""
-        try:
-            for line in open("/etc/os-release"):
-                if line.startswith("PRETTY_NAME="):
-                    os_name = line.split("=", 1)[1].strip().strip('"')
-                    break
-        except Exception:
-            pass
-        try:
-            for line in open("/proc/cpuinfo"):
-                if line.startswith("model name"):
-                    cpu = line.split(":", 1)[1].strip()
-                    break
-        except Exception:
-            pass
+        os_name = f"{platform.system()} {platform.release()}"
+        cpu = platform.processor() or platform.machine()
         _HOST_ID = (host, os_name, cpu)
     return _HOST_ID
 
 
 # ==============================================================================
-# === 5. EJECUCION DE COMANDOS ================================================
+# === 5. EJECUCION DE COMANDOS (PAL: bash / PowerShell) ========================
 # ==============================================================================
 
 def run_cmd(cmd):
-    """Ejecuta un comando bash con guarda anti-destructivos y timeout."""
+    """Ejecuta un comando en la shell nativa del OS con guarda anti-destructivos."""
     for pat in BLOCKED:
-        if re.search(pat, cmd):
+        if re.search(pat, cmd, re.IGNORECASE):
             return "[BLOQUEADO] comando peligroso rechazado"
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                           timeout=CFG["cmd_timeout_sec"])
+        if IS_WINDOWS:
+            full = ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd]
+        else:
+            full = ["bash", "-c", cmd]
+        r = subprocess.run(full, capture_output=True, text=True,
+                           timeout=CFG["cmd_timeout_sec"],
+                           errors="replace",
+                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})
         out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
         return out.strip()[:4000] if out.strip() else "(sin salida)"
     except subprocess.TimeoutExpired:
@@ -462,15 +576,144 @@ def run_cmd(cmd):
 # ==============================================================================
 
 def tg_send(text):
-    """Envia mensaje al chat autorizado. Silencia errores de red (nunca tumba el daemon)."""
+    """Envia mensaje al chat autorizado con reintentos y log (nunca tumba el daemon).
+    Si la red falla, encola en kv 'outbox' y lo entrega al proximo envio exitoso."""
+    for attempt in (1, 2, 3):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{CFG['telegram_token']}/sendMessage",
+                json={"chat_id": CFG["chat_id"], "text": text[:4000]},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                _flush_outbox()
+                return True
+            log.warning("tg_send intento %d: HTTP %s %s", attempt, r.status_code, r.text[:120])
+        except Exception as e:
+            log.warning("tg_send intento %d: %s", attempt, str(e)[:120])
+        time.sleep(2 * attempt)
+    outbox = store_global.get("outbox", []) if store_global else []
+    outbox.append(text[:4000])
+    if store_global:
+        store_global.set("outbox", outbox[-10:])
+    log.error("tg_send FALLO tras reintentos; mensaje encolado (%d)", len(outbox))
+    return False
+
+
+# --- Pipeline visible: burbuja de "escribiendo" + mensaje de estado editable ---
+STAGE_MSG = {
+    "recv":   "\U0001F4E8 Mensaje recibido - entrando al pipeline...",
+    "think":  "\U0001F9E0 Pensando - consultando al modelo...",
+    "search": "\U0001F310 Capa web - buscando en internet...",
+    "exec":   "\u2699\uFE0F Capa shell - ejecutando comandos...",
+    "critic": "\U0001F527 El critic esta corrigiendo el plan...",
+}
+
+
+def tg_action():
+    """Burbuja nativa de 'escribiendo...' (dura ~5s; se refresca en hilo aparte)."""
     try:
         requests.post(
-            f"https://api.telegram.org/bot{CFG['telegram_token']}/sendMessage",
-            json={"chat_id": CFG["chat_id"], "text": text[:4000]},
-            timeout=15,
+            f"https://api.telegram.org/bot{CFG['telegram_token']}/sendChatAction",
+            json={"chat_id": CFG["chat_id"], "action": "typing"},
+            timeout=8,
         )
     except Exception:
         pass
+
+
+def tg_stage_send(text):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{CFG['telegram_token']}/sendMessage",
+            json={"chat_id": CFG["chat_id"], "text": text},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json().get("result", {}).get("message_id")
+    except Exception as e:
+        log.warning("tg_stage_send: %s", str(e)[:120])
+    return None
+
+
+def tg_stage_edit(mid, text):
+    if not mid:
+        return False
+    for attempt in (1, 2, 3):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{CFG['telegram_token']}/editMessageText",
+                json={"chat_id": CFG["chat_id"], "message_id": mid,
+                      "text": text[:4000]},
+                timeout=10,
+            )
+            if r.status_code == 200 or "message is not modified" in r.text:
+                return True
+        except Exception as e:
+            log.warning("tg_stage_edit intento %d: %s", attempt, str(e)[:120])
+        time.sleep(2 * attempt)
+    return False
+
+
+def start_typing(stop_event):
+    def _loop():
+        while not stop_event.wait(4.5):
+            tg_action()
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+# --- Feedback equivalente para la consola (ASCII puro, sin depender de TG) ---
+CLI_STAGE = {
+    "think":  "  . pensando...",
+    "search": "  . buscando en la web...",
+    "exec":   "  . ejecutando comandos...",
+    "critic": "  . corrigiendo plan...",
+}
+
+
+def cli_progress(name):
+    msg = CLI_STAGE.get(name)
+    if msg:
+        print(msg, flush=True)
+
+
+def finish_status(mid, reply, alts=""):
+    """Convierte el placeholder de estado en la respuesta final.
+    Si no se puede editar (red/mensaje viejo), cae a tg_send normal."""
+    full = f"{reply}\n\n{alts}" if alts else reply
+    if mid and len(full) <= 4000 and tg_stage_edit(mid, full):
+        _flush_outbox()
+        return
+    tg_send(reply)
+    if alts:
+        time.sleep(1)
+        tg_send(alts)
+
+
+def _flush_outbox():
+    """Entrega mensajes que quedaron encolados por fallos de red previos."""
+    global store_global
+    if not store_global:
+        return
+    pend = store_global.get("outbox", [])
+    if not pend:
+        return
+    entregados = 0
+    for msg in pend[:]:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{CFG['telegram_token']}/sendMessage",
+                json={"chat_id": CFG["chat_id"], "text": "[pendiente] " + msg[:3900]},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                pend.remove(msg)
+                entregados += 1
+        except Exception:
+            break   # red cayo de nuevo: sigo encolando
+    store_global.set("outbox", pend)
+    if entregados:
+        log.info("outbox: %d mensajes pendientes entregados", entregados)
 
 
 def notify(text):
@@ -802,18 +1045,40 @@ def format_alternatives(alternatives):
     return "\n".join(lines)
 
 
-def handle_turn(user_input, store):
+def handle_turn(user_input, store, progress=None):
     """
     Procesa un turno completo de conversacion.
     Devuelve (respuesta_principal, alternativas_formateadas).
+    progress(nombre_etapa) opcional: avisa en que capa del pipeline va.
     """
+    if progress:
+        progress("think")
     raw = ask_llm(user_input, store)
     data = parse_json_loose(raw) or {"plan": [], "reply": "", "alternatives": []}
+    if not data.get("reply") and not data.get("plan"):
+        # respuesta vacia/ilegible del modelo: un unico reintento
+        if progress:
+            progress("think")
+        raw2 = ask_llm(
+            user_input, store,
+            "(tu respuesta anterior llego vacia o ilegible; "
+            "repeti SOLO el JSON)")
+        data2 = parse_json_loose(raw2)
+        if data2:
+            data = data2
+    if not data.get("reply") and not data.get("plan"):
+        record_error(store, "handle_turn",
+                     "respuesta LLM vacia o ilegible incluso tras reintento "
+                     "(router free saturado o red intermitente)")
 
     # Herramienta de busqueda web: si el modelo la pide, se ejecuta UNA vez,
     # se inyectan los resultados recortados y se hace una sola pasada final.
     if isinstance(data.get("search"), str) and data["search"].strip():
+        if progress:
+            progress("search")
         results = web_search(data["search"].strip())
+        if progress:
+            progress("think")
         raw2 = ask_llm(
             user_input, store,
             f"RESULTADOS DE BUSQUEDA WEB para '{data['search'][:80]}' (recortados, "
@@ -839,12 +1104,16 @@ def handle_turn(user_input, store):
     else:
         plan = data.get("plan", [])
         if plan:
+            if progress:
+                progress("exec")
             results, ok = exec_plan(plan, store)
             for r in results:
                 failed = ("BLOQUEADO" in r["out"] or "TIMEOUT" in r["out"])
                 em = "❌" if failed else "⚙️"
                 out.append(f"{em} {r['cmd']}\n{r['out']}")
             if not ok:
+                if progress:
+                    progress("critic")
                 c = critic_loop(store, user_input, [r["out"] for r in results])
                 if c:
                     out.append(f"[critic] {c[:400]}")
@@ -1130,33 +1399,51 @@ def auto_worker(store):
 _LOCK_FD = None
 
 
+class InstanceLock:
+    """Lock de instancia unica: flock en Unix, msvcrt.locking en Windows."""
+
+    def __init__(self):
+        self._fh = None
+
+    def acquire(self):
+        self._fh = open(PID_FILE, "w")
+        try:
+            if IS_WINDOWS:
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("MicroBot ya corriendo (lock activo).", file=sys.stderr)
+            sys.exit(1)
+        self._fh.write(str(os.getpid()))
+        self._fh.flush()
+
+    def release(self):
+        try:
+            if self._fh:
+                self._fh.close()
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+
+
+_LOCK = InstanceLock()
+
+
 def acquire_lock():
-    """Garantiza instancia unica via flock sobre el PID file (robusto ante PIDs reciclados)."""
-    global _LOCK_FD
-    _LOCK_FD = open(PID_FILE, "w")
-    try:
-        fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print("microbot ya corriendo (lock activo).", file=sys.stderr)
-        sys.exit(1)
-    _LOCK_FD.write(str(os.getpid()))
-    _LOCK_FD.flush()
+    """Garantiza instancia unica via lock sobre el PID file (robusto ante PIDs reciclados)."""
+    _LOCK.acquire()
 
 
 def release_lock():
-    try:
-        if _LOCK_FD:
-            _LOCK_FD.close()
-        os.remove(PID_FILE)
-    except OSError:
-        pass
+    _LOCK.release()
 
 
 def telegram_daemon():
     store = Store(DB_FILE)
     acquire_lock()
     threading.Thread(target=auto_worker, args=(store,), daemon=True).start()
-    tg_send(f"MicroBot v7.1.0 online.\n{get_sys_stats()['str']}\nMulti-respuesta activa. /help")
+    tg_send(f"MicroBot v8.0 online.\n{get_sys_stats()['str']}\nPipeline visible. /help")
     log.info("daemon iniciado (pid %s)", os.getpid())
     last_update = 0
     try:
@@ -1174,21 +1461,30 @@ def telegram_daemon():
                     if not text:
                         continue
                     log.info("mensaje recibido: %s", text[:80])
-                    kind, out = dispatch(text, store)
-                    if kind is True:
-                        if out == RESTART_SENTINEL:
-                            do_restart()
-                        else:
-                            tg_send(out)
-                        continue
-                    if kind == "mision":
-                        executor.submit(run_mission, store, out)
-                        continue
-                    reply, alts = handle_turn(text, store)
-                    tg_send(reply)
-                    if alts:
-                        time.sleep(1)   # evita flood-limit al mandar dos mensajes seguidos
-                        tg_send(alts)
+                    stop_typing = threading.Event()
+                    start_typing(stop_typing)
+                    status_id = tg_stage_send(STAGE_MSG["recv"])
+
+                    def stage(name, sid=status_id):
+                        if sid:
+                            tg_stage_edit(sid, STAGE_MSG[name])
+
+                    try:
+                        kind, out = dispatch(text, store)
+                        if kind is True:
+                            if out == RESTART_SENTINEL:
+                                do_restart()
+                            else:
+                                finish_status(status_id, out)
+                            continue
+                        if kind == "mision":
+                            executor.submit(run_mission, store, out)
+                            finish_status(status_id, f"🎯 Misión iniciada:\n{out}")
+                            continue
+                        reply, alts = handle_turn(text, store, progress=stage)
+                        finish_status(status_id, reply, alts)
+                    finally:
+                        stop_typing.set()
             except Exception as e:
                 record_error(store, "telegram_loop", e)
                 time.sleep(3)
@@ -1208,9 +1504,14 @@ def do_restart():
 # ==============================================================================
 
 def cli():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     store = Store(DB_FILE)
     if len(sys.argv) == 1:
-        print(f"MicroBot v7 - misiones + planes + skills + critic + multi-respuesta. "
+        print(f"MicroBot v8 universal - misiones + planes + skills + critic. "
               f"Limites: {CFG['max_calls_per_day']}/dia. /help")
         while True:
             try:
@@ -1221,6 +1522,7 @@ def cli():
                 continue
             if text.lower() in ("salir", "exit", "quit"):
                 break
+            print(". mensaje recibido", flush=True)
             kind, out = dispatch(text, store)
             if kind is True:
                 print(out)
@@ -1228,7 +1530,7 @@ def cli():
             if kind == "mision":
                 run_mission(store, out)
                 continue
-            reply, alts = handle_turn(text, store)
+            reply, alts = handle_turn(text, store, progress=cli_progress)
             print(reply)
             if alts:
                 print("\n" + alts)
@@ -1256,7 +1558,8 @@ def cli():
         else:
             print(f"comando desconocido: {arg}")
     else:
-        reply, alts = handle_turn(arg, store)
+        print(". mensaje recibido", flush=True)
+        reply, alts = handle_turn(arg, store, progress=cli_progress)
         print(reply)
         if alts:
             print("\n" + alts)
