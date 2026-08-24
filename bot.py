@@ -833,6 +833,8 @@ def cli():
 # ENTRY
 # =====================================================================
 if __name__ == "__main__":
+    try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception: pass
     if len(sys.argv) > 1 and sys.argv[1] in ("--daemon","-d"):
         telegram_daemon()
     elif len(sys.argv) > 1 and sys.argv[1] == "--status":
