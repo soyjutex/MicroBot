@@ -1,223 +1,120 @@
-# 🤖 MicroBot
+# MicroBot
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)]
-[![RAM Footprint](https://img.shields.io/badge/RAM_Idle-~40MB-brightgreen.svg)]
-[![Monthly Cost](https://img.shields.io/badge/Cost-%240%2Fmonth-success.svg)]
-[![Hardware](https://img.shields.io/badge/Tested_on-Pentium_2008-orange.svg)]
+[![RAM Idle](https://img.shields.io/badge/RAM_idle-~40MB-brightgreen.svg)]
+[![Tests](https://img.shields.io/badge/offline_tests-16%2F16-success.svg)]
 
-> **Autonomous Edge AI Agent & SysAdmin in a single Python file — Linux, Windows y macOS.**
-> *Zero-bloat. Self-healing. Built for low-spec hardware (~40MB RAM footprint).*
+> **Agente autónomo de administración de sistemas en un solo archivo Python.**
+> Un `bot.py` idéntico para Linux, Windows y macOS. Pensado desde cero para hardware humilde.
 
-Agente autónomo de administración de sistemas **multiplataforma**: un único `bot.py` idéntico para cualquier OS (la PAL detecta el sistema al arrancar: telemetría nativa, bash o PowerShell como shell de planes, lock de instancia por OS). Se lo habla por **Telegram** o por **terminal**, entiende lenguaje natural vía **OpenRouter (tier Free)**, ejecuta comandos reales del sistema, aprende de sus errores y mantiene memoria persistente semántica. **Todo el proyecto corre con costo cero: $0 en APIs, $0 en infraestructura.**
-
-Incluye `test_harness.py`: batería de pruebas offline (17 checks) que valida PAL, memoria FTS5, seguridad y protocolo en cualquier OS sin red ni API.
-
-## v8 UNIVERSAL
-Hasta v7 el bot era Linux-only; desde **v8.0** el mismo archivo corre en Windows y macOS con todas las capacidades (misiones, critic, skills, compresión nocturna, outbox, pipeline visible). Verificado con 17/17 pruebas en Debian 13 y Windows 10 sobre el mismo código.
+MicroBot es un agente que vive en tu máquina: lo hablás por **Telegram** o por **terminal**,
+entiende lenguaje natural vía un LLM (Google Gemini o cualquier API compatible con OpenAI),
+ejecuta comandos reales del sistema, guarda lo que aprende en memoria semántica propia y
+responde mostrando cada capa del razonamiento.
 
 ```
-[tú] ──Telegram──> MicroBot ──> OpenRouter/free (piensa + planifica en JSON)
-                                  │
-                                  ├──> ejecuta comandos (con guarda anti-destructivos)
-                                  ├──> critica resultados y aprende hechos nuevos
-                                  └──> responde + ofrece variantes (multi-respuesta)
+vos ──Telegram/CLI──> MicroBot ──> LLM (piensa y planifica en JSON)
+                                     │
+                                     ├──> ejecuta comandos (con guarda anti-destructivos)
+                                     ├──> busca en su memoria semántica (SQLite + FTS5)
+                                     ├──> puede buscar en la web si le hace falta
+                                     └──> responde con pipeline visible por capas
 ```
+
+## Por qué existe
+
+La mayoría de los frameworks de agentes (LangChain, AutoGen, CrewAI...) exigen cientos de
+dependencias y máquinas con recursos de sobra. MicroBot es la apuesta contraria:
+
+- **Un solo archivo**: todo el agente es `bot.py`. Lo copiás, lo corés.
+- **Cero bloat**: una sola dependencia externa (`requests`). Todo lo demás es stdlib.
+- **Hardware humilde**: ~40MB de RAM. Probado en un Pentium del 2008 con Debian 13.
+- **Universal por diseño**: la capa PAL (Platform Abstraction Layer) detecta el OS al
+  arrancar — telemetría nativa (`/proc` en Linux, `ctypes`+WMI en Windows), bash o
+  PowerShell como shell de planes, lock de instancia por API nativa de cada sistema.
 
 ## Características
 
-- **Ciclo cerrado**: PENSAR → ACTUAR → OBSERVAR → CRITICAR → APRENDER en cada turno.
-- **Multi-respuesta**: además de la respuesta principal, genera hasta 2 variantes útiles (otra forma de resolverlo, sugerencia de mantenimiento, dato relacionado).
-- **Misiones multi-paso**: `/mision <objetivo>` lanza un bucle agente con corte anti-bucle y pausa inteligente ante falta de permisos o recursos.
-- **Memoria persistente unificada** en SQLite con **búsqueda semántica FTS5**: cada turno inyecta al LLM solo los 3-5 hechos relevantes al mensaje (zero-token bloat), no todo el historial.
-- **Búsqueda web quirúrgica**: el modelo puede pedir búsquedas reales (DuckDuckGo Lite) con coto duro de 3 resultados / 600 caracteres anti-explosión de tokens.
-- **Compresión nocturna**: a las 04:00 consolida hechos duplicados u obsoletos con UNA llamada LLM, con backup previo automático (nada se pierde).
-- **Skills Python reutilizables**: el bot puede crear funciones propias, validadas con `ast.parse` y testeadas automáticamente antes de guardarse.
-- **Presupuesto diario** de llamadas API con alertas al 70%/90% y circuit breaker anti-cascada de errores.
-- **Consciencia de hardware**: lee `/proc` y temperatura; se auto-pausa si la RAM baja o la carga sube (ideal para hardware humilde).
-- **Seguridad por capas**: credenciales fuera del código (`config.json`, chmod 600), lista `BLOCKED` de comandos destructivos, único chat autorizado, instancia única por PID lock.
+- **Pipeline visible**: cada mensaje muestra su progreso real por capas
+  (`recibido → pensando → ejecutando`) editando el mismo mensaje de Telegram. No es un
+  fake loading: es el estado verdadero del agente.
+- **Memoria semántica**: SQLite con FTS5. El bot aprende hechos de cada conversación y
+  solo inyecta al LLM los 3-5 hechos relevantes al mensaje actual (zero-token bloat).
+- **Protocolo JSON estricto**: el LLM responde thought + plan de comandos + búsqueda web +
+  hecho nuevo + status. Parsing tolerante (acepta fences markdown y JSON embebido en prosa).
+- **Guarda anti-destructivos**: lista negra de comandos (`rm -rf /`, `mkfs`, `dd`, `format`,
+  `diskpart`...) validada antes de ejecutar nada.
+- **Presupuesto diario**: coto configurable de llamadas LLM por día con aviso al agotarse.
+- **Outbox persistente**: si Telegram falla, los mensajes quedan en cola y se reintentan.
+- **Skills Python**: el bot puede escribir funciones propias, validarlas con `ast.parse`
+  y testearlas antes de guardarlas para reutilizarlas.
+- **Comandos zero-API**: `/status`, `/recursos`, `/todo`, `/nota`, `/idea`, `/agenda`,
+  `/skills`, `/help` funcionan sin gastar presupuesto del LLM.
+- **Lock de instancia**: imposible correr dos daemons sobre la misma base de datos.
 
-### 🥊 ¿Por qué MicroBot vs Otros Frameworks?
-
-| Característica | MicroBot | AutoGPT / CrewAI / LangChain |
-| :--- | :---: | :---: |
-| **Consumo de RAM** | **~22 MB** | 400 MB - 2 GB+ |
-| **Complejidad** | **1 script Python** | Docenas de dependencias y Docker |
-| **Hardware mínimo** | **Pentium 2008 / 512MB RAM** | CPUs modernas / 8GB+ RAM |
-| **Costo Operativo** | **$0.00 / mes** | Requiere planes pagos o APIs costosas |
-| **Curva de instalación** | **1 comando (`install.sh`)** | Alta (Entornos virtuales, contenedores) |
-
-### 📸 Capturas
-
-> *GIF de una `/mision` ejecutándose paso a paso y respuesta con variantes — [pendiente capturar desde Telegram].*
-> Mientras tanto podés ver el dashboard en vivo: `http://IP-DEL-SERVIDOR:8080` (CPU/RAM/temp + memoria del bot).
-
-## Requisitos
-
-- Debian/Ubuntu (probado en Debian 13, Python 3.13) — cualquier Linux moderno sirve
-- Python 3.10+
-- Una API key de [OpenRouter](https://openrouter.ai/keys) — **gratis, sin tarjeta de crédito** (modelo `openrouter/free`)
-- Un bot de Telegram ([@BotFather](https://t.me/BotFather)) y tu chat ID
-
-## Instalación rápida
+## Instalación rápida (Debian/Ubuntu)
 
 ```bash
 git clone https://github.com/soyjutex/MicroBot.git
 cd MicroBot
-
-# 1. Configurar credenciales
-cp config.example.json config.json
-nano config.json          # completa api_key (OpenRouter), telegram_token y chat_id
-
-# 2. Instalar como servicio root (caja dedicada)
+cp config.example.json config.json   # completá tus credenciales
 sudo bash install/install.sh
 ```
 
-El instalador: copia el código a `/opt/microbot/`, migra memoria vieja si existe (`~/.bot_memory.json` o `~/.nexus_brain.db`), instala el servicio systemd **root** (`microbot.service`) y crea el comando global `microbot`.
+El instalador corre el harness offline, instala el servicio systemd y deja el comando
+global `microbot` en el PATH.
 
-> **¿Sin systemd?** (macOS, BSD, contenedores, servidores sin root) Ejecución directa en background:
-> ```bash
-> nohup python3 bot.py --daemon > /dev/null 2>&1 &
-> ```
+### En Windows
 
-### 🔌 Multi-proveedor LLM (agnóstico)
+No hay servicio: corré el daemon oculto con
 
-MicroBot funciona con **cualquier API compatible OpenAI** — solo cambiás `base_url` y `model` en `config.json`, sin tocar código:
-
-| Proveedor | `base_url` | `model` |
-|---|---|---|
-| OpenRouter (gratis, default) | `https://openrouter.ai/api/v1` | `openrouter/free` |
-| Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
-| Ollama local (sin key) | `http://localhost:11434/v1` | `llama3.2` |
-| Gemini directo | — | `provider: "gemini"` |
-
-### 🔐 Configuración por variables de entorno
-
-Toda clave de `config.json` puede sobreescribirse con variables de entorno `MICROBOT_*` — ideal para Docker, Kubernetes o VPS efímeros:
-
-```bash
-MICROBOT_API_KEY=sk-or-v1-... \
-MICROBOT_TELEGRAM_TOKEN=123:abc \
-MICROBOT_CHAT_ID=456 \
-python3 bot.py --daemon
+```powershell
+Start-Process pythonw -ArgumentList "bot.py","--daemon" -WindowStyle Hidden
 ```
+
+y guardá ese comando como tarea programada "Al iniciar sesión" si querés auto-arranque.
+
+## Configuración
+
+Copiá `config.example.json` a `config.json` (junto a `bot.py` o en `~/.microbot/`):
+
+| Clave | Descripción |
+|---|---|
+| `api_key` | Tu API key (Gemini u OpenRouter) |
+| `base_url` | Endpoint de la API |
+| `model` | Modelo a usar |
+| `telegram_token` | Token del bot de Telegram (@BotFather) |
+| `chat_id` | Tu chat ID (único chat autorizado) |
+| `max_calls_day` | Presupuesto diario de llamadas LLM |
 
 ## Uso
 
-**Terminal:**
 ```bash
-microbot                        # chat interactivo
-microbot "cuánta RAM libre?"    # consulta puntual (responde + variantes)
-microbot --status               # presupuesto y estado del breaker
-microbot --compactar            # fuerza la compresión de memoria (lo mismo que hace a las 04:00)
+microbot --status                  # telemetría del host sin gastar API
+microbot "cuánta ram libre hay"    # consulta one-shot
+microbot                           # modo interactivo
+python3 bot.py --daemon            # daemon Telegram (systemd lo hace solo)
+python3 test_harness.py            # 16 pruebas offline, sin red ni API key
 ```
 
-**Dentro del chat interactivo / Telegram:**
-```
-/help /status /recursos /memoria /errors /skills /misiones
-/nota <texto> /notas /idea <texto> /ideas    # notas locales, zero-API
-/mision <objetivo>           # tarea multi-paso con bucle agente
-/skill save|test|run|del <nombre>
-/auto on|off                 # bucle de auto-mejora cada 30 min
-/stopauto /resetauto /restart
-```
+Por Telegram: hablale en lenguaje natural. `/help` lista los comandos locales.
 
-**Operación:**
-```bash
-systemctl status microbot       # estado del servicio
-journalctl -u microbot -f       # logs en vivo
-```
-
-**Dashboard:** abrí `http://IP-DEL-SERVIDOR:8080` — CPU/RAM/disco/temperatura en vivo, memoria del bot (hechos, conversaciones, errores, skills) y cola del log. Solo lectura, sin frameworks, datos reales de SQLite y `/proc`.
-
-## Multi-respuesta (v7)
-
-Cuando respondemos algo, MicroBot devuelve su respuesta principal y hasta 2 alternativas:
+## Arquitectura (30 segundos)
 
 ```
-> ¿cómo está el servidor?
-
-RAM 1497MB libres de 1905MB, load 0.07, disco al 3%. Todo normal.
-
-🤖 Variantes:
-1. Si querés puedo programar un reporte diario automático con /auto on.
-2. El disco está casi vacío; buen momento para hacer backup de configuraciones.
+bot.py (~650 líneas)
+├── PAL          telemetría, run_cmd, lock de instancia (por OS)
+├── BRAIN        SQLite + FTS5: facts, history, kv, skills, outbox, budget
+├── TELEGRAM     core con pipeline visible (typing + edición por capas)
+├── LLM          cliente agnóstico (Gemini native / OpenAI-compatible)
+├── SKILLS       código Python validado con ast + test automático
+├── MISSIONS     bucle multi-paso con corte anti-bucle
+├── COMMANDS     dispatch zero-API (/status, /todo, ...)
+└── DAEMONS      auto-worker, compresor nocturno, scheduler
 ```
-
-Las variantes son opcionales para el modelo: solo aparecen cuando aportan valor real.
-
-## Estructura del proyecto
-
-```
-├── bot.py                  # código completo del agente (una sola fuente)
-├── config.example.json     # plantilla de configuración (sin secretos)
-├── requirements.txt        # única dependencia: requests
-├── install/
-│   ├── install.sh          # instalador (systemd root + migración)
-│   ├── microbot.service    # unidad systemd
-│   └── migrate_memory.py   # migrador JSON+SQLite-viejo → SQLite v7
-├── dashboard/              # dashboard web simple (CPU/RAM/temp/logs)
-│   ├── dashboard.html      # interfaz (HTML+CSS+JS puro, sin frameworks)
-│   └── server.py           # servidor stdlib de solo lectura, puerto 8080
-└── docs/                   # arquitectura, historia y guía de operación
-```
-
-En runtime (servidor):
-```
-/opt/microbot/
-├── bot.py                  # código
-├── config.json             # credenciales (chmod 600, nunca en git)
-├── dashboard/              # dashboard web (servido en :8080)
-└── data/
-    ├── microbot.db         # memoria SQLite unificada
-    └── microbot.log        # log propio
-```
-
-## Diseño de seguridad
-
-| Capa | Mecanismo |
-|---|---|
-| Secretos | `config.json` chmod 600, excluido por `.gitignore`, override por variables de entorno `MICROBOT_*` |
-| Comandos | Regex `BLOCKED`: `rm -rf /`, `mkfs`, `dd`, fork-bomb, `shutdown`, etc. |
- | Acceso | Un único `chat_id` autorizado en Telegram |
-| Instancia | PID lock en `/tmp/microbot.pid` |
-| Presupuesto | Límite diario de llamadas + circuit breaker con backoff exponencial |
-| Recursos | Auto-pausa si RAM < 150MB o load > 4 |
-
-## Documentación
-
-- [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md) — cómo funciona por dentro: flujo, protocolo JSON, memoria FTS5, presupuesto y seguridad.
-- [`docs/HISTORIA.md`](docs/HISTORIA.md) — cronología completa: cómo creció de script a agente autónomo multiplataforma.
-- [`docs/OPERACION.md`](docs/OPERACION.md) — instalación, actualización, backups y diagnóstico rápido.
-
-## Hardware de origen
-
-Este proyecto nació y corre en una Compaq del 2008: Pentium Dual T3200 @ 2GHz, 2GB RAM (+2.9GB zram), HDD 160GB, Debian 13 (Trixie). Por eso el diseño es obsesivo con recursos: sin Docker, sin modelos locales, sin frameworks — solo Python + requests + SQLite.
-
-### 📊 Benchmark real (compacserver)
-
-| Métrica | Valor |
-|---|---|
-| CPU | Intel Pentium Dual T3200 @ 2.00GHz (2008) |
-| RAM en idle (proceso completo) | **~22MB** |
-| RAM del equipo | 2GB DDR2 + zram activo |
-| SO | Debian GNU/Linux 13 (Trixie) |
-| LLM | OpenRouter Free (`openrouter/free`) |
-| Costo mensual | **$0** |
-
-## Costo total del proyecto: $0
-
-| Componente | Servicio | Costo |
-|---|---|---|
-| Cerebro LLM | OpenRouter tier Free (`openrouter/free`) | $0 |
-| Infraestructura | Notebook reciclada del 2008 | $0 |
-| Interfaz | Bot de Telegram | $0 |
-| Memoria / datos | SQLite local | $0 |
-| Monitoreo | Dashboard propio en Python stdlib | $0 |
-
-Ninguna parte de la cadena tiene costo mensual: el hardware es reciclado, el LLM usa los endpoints gratuitos de OpenRouter y todo lo demás es software propio corriendo en la misma máquina.
 
 ## Licencia
 
-MIT
+MIT — hacé lo que quieras, no hay garantía.
