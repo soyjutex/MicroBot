@@ -6,10 +6,90 @@ Single-file, multiplatform (Linux/macOS/Windows/Termux).
 RAM ~35MB | Deps: Python 3.10+ + requests.
 """
 
-import os, sys, json, time, signal, datetime, threading, subprocess, re, ast, platform, sqlite3, html, tempfile
-from urllib.parse import quote_plus
-from concurrent.futures import ThreadPoolExecutor
+import os, sys, json, time, signal, datetime, threading, subprocess, re, ast, platform, sqlite3, html, tempfile, shutil
 import requests
+
+# =====================================================================
+# 1. MOTOR DE EDICION QUIRURGICA (AIDER-STYLE)
+# =====================================================================
+def apply_search_replace(filepath, diff_text):
+    if not os.path.exists(filepath): return f"[ERROR] '{filepath}' no existe."
+    pattern = re.compile(r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE", re.DOTALL)
+    matches = pattern.findall(diff_text)
+    if not matches: return "[ERROR] Formato de parche inválido."
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f: content = f.read()
+    new_content = content
+    for search_block, replace_block in matches:
+        if search_block not in new_content: return f"[ERROR] No se encontró SEARCH."
+        new_content = new_content.replace(search_block, replace_block, 1)
+    if filepath.endswith(".py"):
+        try: ast.parse(new_content)
+        except SyntaxError as e: return f"[RECHAZADO] Error sintaxis: {e}"
+    bak = f"{filepath}.bak.{int(time.time())}"
+    shutil.copy2(filepath, bak)
+    with open(filepath, "w", encoding="utf-8") as f: f.write(new_content)
+    return f"[ÉXITO] Parche aplicado. Backup: {os.path.basename(bak)}"
+
+def get_code_map(filepath):
+    if not os.path.exists(filepath): return f"[ERROR] '{filepath}' no existe."
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            tree = ast.parse(f.read(), filename=filepath)
+        outline = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef): outline.append(f"• class {node.name} (línea {node.lineno})")
+            elif isinstance(node, ast.FunctionDef):
+                args = [a.arg for a in node.args.args]
+                outline.append(f"  └─ def {node.name}({', '.join(args)}) (líneas {node.lineno}-{node.end_lineno or '?'})")
+        return "\n".join(outline) if outline else "(No se encontraron funciones/clases)"
+    except Exception as e: return f"[ERROR AST] {e}"
+
+def read_file_slice(filepath, start_line, end_line):
+    if not os.path.exists(filepath): return f"[ERROR] '{filepath}' no existe."
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f: lines = f.readlines()
+        start, end = max(1, int(start_line)), min(len(lines), int(end_line))
+        return "".join([f"{i + start}: {line}" for i, line in enumerate(lines[start - 1 : end])])
+    except Exception as e: return f"[ERROR LECTURA] {e}"
+
+# =====================================================================
+# 2. MOTOR COGNITIVO (REACT + DUAL-ROLE)
+# =====================================================================
+class AgentState:
+    def __init__(self, goal, max_steps=3):
+        self.goal = goal
+        self.max_steps = max_steps
+        self.current_step = 0
+        self.history = []
+        self.tried = set()
+        self.final_reply = ""
+        self.learned_fact = ""
+
+def run_state_machine(goal, max_steps=3, progress=None):
+    state = AgentState(goal, max_steps)
+    msgs = [{"role": "user", "content": goal}]
+    while state.current_step < state.max_steps:
+        if progress: progress("think")
+        data = parse_json(ask_llm_msgs(msgs))
+        action = _extract_action(data)
+        if not action or data.get("status") in ("SUCCESS", "FAILED"):
+            state.final_reply = data.get("reply", "Completado.")
+            state.learned_fact = data.get("new_fact", "")
+            break
+        kind, payload = action
+        if progress: progress("search" if kind == "search" else "exec")
+        if kind == "cmd":
+            if payload in state.tried: obs = "OBSERVATION: Comando repetido. Cambia de estrategia."
+            else: obs = run_cmd(payload)[:800]; state.tried.add(payload)
+        elif kind == "search": obs = web_search(payload)[:800]
+        elif kind == "patch": obs = apply_search_replace(data.get("patch_file", ""), payload)
+        elif kind == "map": obs = get_code_map(payload)
+        elif kind == "slice": obs = read_file_slice(payload.get("file"), payload.get("start"), payload.get("end"))
+        msgs.append(_react_assistant_msg(data.get("thought", ""), f"{kind}: {payload}"))
+        msgs.append({"role": "user", "content": f"OBSERVATION:\n{obs}"})
+        state.current_step += 1
+    if state.learned_fact: add_fact(state.learned_fact)
+    return state.final_reply
 
 # =====================================================================
 # 1. PLATFORM ABSTRACTION LAYER (PAL)
@@ -379,18 +459,15 @@ def ask_llm_msgs(msgs, extra=""):
     if playbooks: mem_str += "\nPLAYBOOKS PROBADOS: " + "\n".join(playbooks[:3])
     # Layout prompt-caching friendly (#1): protocolo estático PRIMERO, datos dinámicos AL FINAL.
     sys_prompt = (
-        f"Eres MicroBot v8, agente sysadmin ({platform.system()}).\n"
-        f"Protocolo ReAct: piensas, ejecutas UNA acción, lees la OBSERVATION y decides de nuevo.\n"
-        f"- Si necesitas datos del sistema: plan=[{{\"cmd\":\"UN solo comando\"}}] o search=\"query\".\n"
-        f"- Cuando la observación alcanza para responder: sin plan ni search, escribe reply final.\n"
-        f"- NUNCA repitas un mismo comando dentro de un turno; si falla, diagnostica con otro comando distinto.\n"
-        f"- new_fact: receta reutilizable solo si aprendiste algo no trivial, "
-        f"formato '[DISPARADOR: sintoma] -> [SOLUCION: comando o procedimiento]'.\n"
-        f"Devuelve SOLO JSON:\n"
-        f'{{"thought":"...","plan":[{{"cmd":"","expect":""}}],"search":"","new_fact":"",'
-        f'"status":"SUCCESS|CONTINUE|FAILED","reply":"...","alternatives":[]}}'
-        f"{extra}"
-        f"\n<datos_del_sistema host_stats=\"{get_stats()['str']}\"{mem_str} />"
+        f"Eres MicroBot v8.1 ({platform.system()}). Stats: {stats}.\n"
+        f"PROTOCOLO COGNITIVO DUAL (CrewAI/DeepSeek Style):\n"
+        f"- [ARQUITECTO]: Define la estrategia óptima para la meta.\n"
+        f"- [AUDITOR]: Valida seguridad, eficiencia de RAM ({CFG['ram_min_mb']}MB) y sintaxis.\n"
+        f"HERRAMIENTAS:\n"
+        f"- plan: [{{\"cmd\":\"...\"}}] | search: \"...\" | patch: \"<<<<...>>>>\" (Aider format) | map: \"archivo.py\" | slice: {{\"file\":\"...\", \"start\":1, \"end\":10}}\n"
+        f"new_fact: formato '[DISPARADOR: sintoma] -> [SOLUCION: comando o procedimiento]'.\n"
+        f"Memoria: {json.dumps(facts, ensure_ascii=False)}\n"
+        f"Devuelve SOLO JSON: {{\"thought\":\"[ARQUITECTO]...[AUDITOR]...\",\"plan\":[],\"search\":\"\",\"patch_file\":\"\",\"new_fact\":\"\",\"reply\":\"\"}}"
     )
     t0 = time.time()
     try:

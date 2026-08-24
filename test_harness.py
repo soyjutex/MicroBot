@@ -129,6 +129,26 @@ def t_mission_dispatch():
     assert kind == "mision" and goal == "revisar logs del sistema"
     assert bot.dispatch("/mision") != "mision"  # sin objetivo no es mision
 
+# AIDER & OPENHANDS ARCHITECTURE TESTS
+def t_search_replace():
+    tmp = os.path.join(tempfile.mkdtemp(), "test.py")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("def foo():\n    return False\n")
+    diff = "<<<<<<< SEARCH\ndef foo():\n    return False\n=======\ndef foo():\n    return True\n>>>>>>> REPLACE"
+    res = bot.apply_search_replace(tmp, diff)
+    assert "ÉXITO" in res
+    with open(tmp, "r", encoding="utf-8") as f:
+        assert "return True" in f.read()
+
+def t_code_map_and_slice():
+    tmp = os.path.join(tempfile.mkdtemp(), "test_map.py")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("class Dummy:\n    def bar(self, x):\n        pass\n")
+    m = bot.get_code_map(tmp)
+    assert "Dummy" in m and "bar" in m
+    sl = bot.read_file_slice(tmp, 1, 3)
+    assert "class Dummy" in sl
+
 # SKILLS
 def t_skill():
     db = os.path.join(tempfile.mkdtemp(), "t.db")
