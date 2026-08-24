@@ -337,7 +337,8 @@ def ask_llm_msgs(msgs, extra=""):
         f"- Si necesitas datos del sistema: plan=[{{\"cmd\":\"UN solo comando\"}}] o search=\"query\".\n"
         f"- Cuando la observación alcanza para responder: sin plan ni search, escribe reply final.\n"
         f"- NUNCA repitas un mismo comando dentro de un turno; si falla, diagnostica con otro comando distinto.\n"
-        f"- new_fact: guarda recetas reutilizables (problema → solución), no trivialidades.\n"
+        f"- new_fact: receta reutilizable solo si aprendiste algo no trivial, "
+        f"formato '[DISPARADOR: sintoma] -> [SOLUCION: comando o procedimiento]'.\n"
         f"Devuelve SOLO JSON:\n"
         f'{{"thought":"...","plan":[{{"cmd":"","expect":""}}],"search":"","new_fact":"",'
         f'"status":"SUCCESS|CONTINUE|FAILED","reply":"...","alternatives":[]}}'
@@ -420,38 +421,10 @@ def validate_code(code):
     return True, "ok"
 
 # =====================================================================
-# 8. MISSION ENGINE
 # =====================================================================
-def execute_mission(goal):
-    if not resources_ok():
-        tg_send(f"[MISION PAUSA] Recursos bajos: {get_stats()['str']}"); return
-    tg_send(f"🎯 Misión: {goal}\nMax {CFG['mission_max_steps']} pasos.")
-    history = []
-    for step in range(1, CFG["mission_max_steps"]+1):
-        prompt = f"GOAL: {goal}\nSTEP {step}/{CFG['mission_max_steps']}\nHISTORY: {json.dumps(history, ensure_ascii=False)}"
-        data = parse_json(ask_llm(prompt, "MODO MISION: devuelve plan mínimo, status SUCCESS/FAILED/NEEDS_HELP."))
-        if data.get("new_fact"): add_fact(data["new_fact"])
-        if data.get("search"):
-            res = web_search(data["search"])
-            history.append({"tool":"web","q":data["search"],"out":res[:300]})
-            continue
-        plan = data.get("plan", [])
-        if plan:
-            for p in plan:
-                cmd = p.get("cmd","") if isinstance(p, dict) else str(p)
-                out = run_cmd(cmd)
-                history.append({"cmd":cmd,"out":out[:300]})
-                tg_send(f"Paso {step} ⚙️ `{cmd}`\n{out[:600]}")
-        status = (data.get("status") or "SUCCESS").upper()
-        if status in ("SUCCESS","FAILED","NEEDS_HELP") or not plan:
-            tg_send(f"[{status}] {data.get('reply','Misión finalizada.')}")
-            break
-        time.sleep(1)
-
+# 8. COMMANDS ZERO-API
 # =====================================================================
-# 9. COMMANDS ZERO-API
-# =====================================================================
-def dispatch(text, store=None):
+def dispatch(text):
     t = text.strip(); tl = t.lower()
     if tl == "/help":
         return True, ("🤖 *MicroBot v8 Universal*\n"
@@ -472,19 +445,27 @@ def dispatch(text, store=None):
         return True, "📝 " + ("\n".join(f"[{r['id']}] ⬜ {r['task']}" for r in rows) or "vacía")
     if tl.startswith("/todo add "):
         task = t[10:].strip()
-        db().execute("INSERT INTO todos (task, ts) VALUES (?, ?)", (task, datetime.datetime.now().isoformat())); db().commit()
+        with db() as c:
+            c.execute("INSERT INTO todos (task, ts) VALUES (?, ?)", (task, datetime.datetime.now().isoformat()))
+            c.commit()
         return True, f"📝 Guardada: {task}"
     if tl.startswith("/todo done "):
         arg = t[11:].strip()
-        db().execute("UPDATE todos SET done=1 WHERE id=? OR task LIKE ?", (arg, f"%{arg}%")); db().commit()
+        with db() as c:
+            c.execute("UPDATE todos SET done=1 WHERE id=? OR task LIKE ?", (arg, f"%{arg}%"))
+            c.commit()
         return True, f"✅ {arg}"
     if tl == "/nota list":
         rows = db().execute("SELECT key, value FROM notes").fetchall()
         return True, "📌 " + ("\n".join(f"• {r['key']}: {r['value']}" for r in rows) or "vacías")
     if tl.startswith("/nota set "):
-        _, k, v = t.split(" ", 2)
-        db().execute("INSERT OR REPLACE INTO notes (key, value, ts) VALUES (?, ?, ?)",
-                     (k, v, datetime.datetime.now().isoformat())); db().commit()
+        parts = t.split(" ", 3)
+        if len(parts) < 4: return True, "Uso: /nota set <clave> <contenido>"
+        _, _, k, v = parts
+        with db() as c:
+            c.execute("INSERT OR REPLACE INTO notes (key, value, ts) VALUES (?, ?, ?)",
+                      (k, v, datetime.datetime.now().isoformat()))
+            c.commit()
         return True, f"📌 {k} guardada."
     if tl.startswith("/nota get "):
         k = t[10:].strip()
@@ -494,11 +475,16 @@ def dispatch(text, store=None):
         rows = db().execute("SELECT idea, ts FROM ideas ORDER BY id DESC LIMIT 10").fetchall()
         return True, "💡 " + ("\n".join(f"• [{r['ts'][:10]}] {r['idea']}" for r in rows) or "vacías")
     if tl.startswith("/idea "):
-        db().execute("INSERT INTO ideas (idea, ts) VALUES (?, ?)", (t[6:].strip(), datetime.datetime.now().isoformat())); db().commit()
+        with db() as c:
+            c.execute("INSERT INTO ideas (idea, ts) VALUES (?, ?)", (t[6:].strip(), datetime.datetime.now().isoformat()))
+            c.commit()
         return True, "💡 Idea guardada."
     if tl == "/agenda":
         rows = db().execute("SELECT id, schedule_time, task, daily FROM schedules").fetchall()
         return True, "⏰ " + ("\n".join(f"[{r['id']}] ({'Diaria' if r['daily'] else 'Puntual'} {r['schedule_time']}): {r['task']}" for r in rows) or "vacía")
+    if tl.startswith("/mision "):
+        goal = t[8:].strip()
+        if goal: return "mision", goal
     return False, None
 
 # =====================================================================
@@ -519,10 +505,10 @@ def _react_assistant_msg(thought, label):
     return {"role": "assistant", "content": json.dumps(
         {"thought": thought[:300], "action": label}, ensure_ascii=False)}
 
-def handle_turn(text, progress=None):
+def handle_turn(text, progress=None, max_substeps=None):
     if not resources_ok():
         return f"[PAUSA RECURSOS] {get_stats()['str']}", ""
-    max_steps = int(CFG.get("max_substeps", 3))
+    max_steps = int(max_substeps or CFG.get("max_substeps", 3))
     msgs = [{"role": "user", "content": text}]
     tried = set()
     step = 0
@@ -575,10 +561,14 @@ def handle_turn(text, progress=None):
 # =====================================================================
 def auto_worker():
     while True:
-        time.sleep(300)
-        if not budget_ok() or not resources_ok(): continue
-        data = parse_json(ask_llm("Hacé una micro-tarea de mantenimiento: limpieza, backup, nota útil."))
-        if data.get("plan"): handle_turn("auto-mantenimiento")
+        time.sleep(1800)  # cada 30 min: el mantenimiento no debe canibalizar el presupuesto
+        if not resources_ok(): continue
+        # reserva: si quedan menos de 10 calls, priorizar charlas del usuario
+        today = datetime.date.today().isoformat()
+        row = db().execute("SELECT calls FROM usage WHERE date=?", (today,)).fetchone()
+        if (row[0] if row else 0) > CFG["max_calls_day"] - 10: continue
+        handle_turn("auto-mantenimiento: chequeo rápido de disco, memoria y logs del sistema. "
+                    "Si detectás algo corregible, corregilo; guardá receta si aprendés algo.")
 
 def compressor():
     while True:
@@ -637,6 +627,12 @@ def telegram_daemon():
                         if mid: tg_stage_edit(mid, STAGE.get(name, ""))
                     try:
                         handled, out = dispatch(txt)
+                        if handled == "mision":
+                            tg_stage_edit(mid, STAGE["think"] + "\n🎯 Misión en curso...")
+                            reply, alts = handle_turn(out, progress=stage,
+                                                      max_substeps=int(CFG.get("mission_max_steps", 6)))
+                            finish_status(mid, f"🎯 {reply}", alts)
+                            continue
                         if handled:
                             finish_status(mid, out); continue
                         reply, alts = handle_turn(txt, progress=stage)
@@ -647,6 +643,15 @@ def telegram_daemon():
                 time.sleep(3)
     finally:
         lock.release()
+
+def route_text(txt, progress=None):
+    """Enruta un texto: comandos zero-API -> misiones (6 pasos) -> turno ReAct normal."""
+    h, o = dispatch(txt)
+    if h == "mision":
+        r, a = handle_turn(o, progress=progress, max_substeps=int(CFG.get("mission_max_steps", 6)))
+        return f"🎯 {r}", a
+    if h: return o, ""
+    return handle_turn(txt, progress=progress)
 
 # =====================================================================
 # 13. CLI
@@ -659,9 +664,7 @@ def cli():
         try: txt = input("\n[microbot] > ").strip()
         except (EOFError, KeyboardInterrupt): break
         if not txt or txt.lower() in ("salir","exit","quit"): break
-        h, o = dispatch(txt)
-        if h: print(o); continue
-        r, a = handle_turn(txt, progress=lambda n: print(f"  · {STAGE.get(n,'')}", flush=True))
+        r, a = route_text(txt, lambda n: print(f"  · {STAGE.get(n,'')}", flush=True))
         print(r)
         if a: print(a)
 
@@ -682,7 +685,7 @@ if __name__ == "__main__":
         # one-shot query
         txt = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else ""
         if txt:
-            r, a = handle_turn(txt, progress=lambda n: print(f"  · {STAGE.get(n,'')}", flush=True))
+            r, a = route_text(txt, lambda n: print(f"  · {STAGE.get(n,'')}", flush=True))
             print(r)
             if a: print(a)
         else:

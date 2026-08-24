@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Harness offline — 17 checks, sin red ni API."""
-import os, sys, tempfile, json
+"""Harness offline — 20 checks, sin red ni API."""
+import os, sys, tempfile, json, sqlite3
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bot
 
@@ -102,6 +102,26 @@ def t_react_msg():
     assert m["role"] == "assistant"
     d = json.loads(m["content"])
     assert d["thought"] == "pensando X" and d["action"] == "cmd: free -m"
+
+# SLASH COMMANDS: persistencia real en SQLite (regresion bug db() x2)
+def t_slash_persistence():
+    db = os.path.join(tempfile.mkdtemp(), "t.db")
+    bot.DB_FILE = db; bot.init_db()
+    ok1, _ = bot.dispatch("/todo add comprar pan")
+    ok2, _ = bot.dispatch("/idea probar react")
+    ok3, _ = bot.dispatch("/nota set server compacserver")
+    assert ok1 is True and ok2 is True and ok3 is True
+    c = sqlite3.connect(db)  # conexion NUEVA: si hubo rollback, esto no ve nada
+    assert c.execute("SELECT COUNT(*) FROM todos").fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM ideas").fetchone()[0] == 1
+    assert c.execute("SELECT value FROM notes WHERE key='server'").fetchone()[0] == "compacserver"
+    c.close()
+
+# MISIONES via marcador dispatch -> handle_turn(max_substeps)
+def t_mission_dispatch():
+    kind, goal = bot.dispatch("/mision revisar logs del sistema")
+    assert kind == "mision" and goal == "revisar logs del sistema"
+    assert bot.dispatch("/mision") != "mision"  # sin objetivo no es mision
 
 # SKILLS
 def t_skill():
