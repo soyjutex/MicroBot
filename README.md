@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)]
 [![RAM Idle](https://img.shields.io/badge/RAM_idle-~40MB-brightgreen.svg)]
-[![Tests](https://img.shields.io/badge/offline_tests-16%2F16-success.svg)]
+[![Tests](https://img.shields.io/badge/offline_tests-18%2F18-success.svg)]
 
 > **Agente autónomo de administración de sistemas en un solo archivo Python.**
 > Un `bot.py` idéntico para Linux, Windows y macOS. Pensado desde cero para hardware humilde.
@@ -15,12 +15,13 @@ ejecuta comandos reales del sistema, guarda lo que aprende en memoria semántica
 responde mostrando cada capa del razonamiento.
 
 ```
-vos ──Telegram/CLI──> MicroBot ──> LLM (piensa y planifica en JSON)
+vos ──Telegram/CLI──> MicroBot ──> ciclo ReAct (max 3 sub-pasos)
                                      │
-                                     ├──> ejecuta comandos (con guarda anti-destructivos)
-                                     ├──> busca en su memoria semántica (SQLite + FTS5)
-                                     ├──> puede buscar en la web si le hace falta
-                                     └──> responde con pipeline visible por capas
+   ┌─────────────────────────────────┤
+   │  🧠 THINK   el LLM decide en JSON: actuar o responder
+   │  ⚙️ ACT     UN comando / UNA búsqueda web
+   │  👁️ OBSERVE la salida vuelve al LLM en privado (el usuario no ve errores crudos)
+   └──> repite o concluye ──> reply final + receta aprendida si aplica
 ```
 
 ## Por qué existe
@@ -37,11 +38,17 @@ dependencias y máquinas con recursos de sobra. MicroBot es la apuesta contraria
 
 ## Características
 
+- **Ciclo ReAct con auto-corrección**: el bot no es un pipeline lineal. Razona, ejecuta UN comando,
+  lee la observación en privado y decide de nuevo (hasta 3 micro-pasos por turno). Si un comando
+  falla, diagnostica con otro distinto antes de hablarte — vos solo recibís la conclusión.
+- **Loop Guard**: si intenta repetir un mismo comando dentro del turno, el sistema se lo impide
+  y le exige cambiar de estrategia o concluir. Inmune a bucles infinitos.
 - **Pipeline visible**: cada mensaje muestra su progreso real por capas
   (`recibido → pensando → ejecutando`) editando el mismo mensaje de Telegram. No es un
   fake loading: es el estado verdadero del agente.
-- **Memoria semántica**: SQLite con FTS5. El bot aprende hechos de cada conversación y
-  solo inyecta al LLM los 3-5 hechos relevantes al mensaje actual (zero-token bloat).
+- **Aprendizaje procedimental**: no guarda trivialidades. Cuando resuelve algo no trivial,
+  sintetiza una receta reutilizable (problema → solución) que la búsqueda FTS5 recupera
+  en turnos futuros.
 - **Protocolo JSON estricto**: el LLM responde thought + plan de comandos + búsqueda web +
   hecho nuevo + status. Parsing tolerante (acepta fences markdown y JSON embebido en prosa).
 - **Guarda anti-destructivos**: lista negra de comandos (`rm -rf /`, `mkfs`, `dd`, `format`,
@@ -88,6 +95,7 @@ Copiá `config.example.json` a `config.json` (junto a `bot.py` o en `~/.microbot
 | `telegram_token` | Token del bot de Telegram (@BotFather) |
 | `chat_id` | Tu chat ID (único chat autorizado) |
 | `max_calls_day` | Presupuesto diario de llamadas LLM |
+| `max_substeps` | Micro-pasos ReAct por turno (default 3) |
 
 ## Uso
 
@@ -109,6 +117,7 @@ bot.py (~650 líneas)
 ├── BRAIN        SQLite + FTS5: facts, history, kv, skills, outbox, budget
 ├── TELEGRAM     core con pipeline visible (typing + edición por capas)
 ├── LLM          cliente agnóstico (Gemini native / OpenAI-compatible)
+├── REACT LOOP   razonar → actuar → observar, loop guard, step budget
 ├── SKILLS       código Python validado con ast + test automático
 ├── MISSIONS     bucle multi-paso con corte anti-bucle
 ├── COMMANDS     dispatch zero-API (/status, /todo, ...)

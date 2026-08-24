@@ -163,6 +163,7 @@ def load_config():
         "telegram_token": env("TELEGRAM_TOKEN", file_cfg.get("telegram_token", "")),
         "chat_id":        str(env("CHAT_ID", file_cfg.get("chat_id", ""))),
         "max_calls_day":  int(file_cfg.get("max_calls_day", 45)),
+        "max_substeps":   int(file_cfg.get("max_substeps", 3)),
         "cmd_timeout_sec": int(file_cfg.get("cmd_timeout_sec", 60)),
         "mission_max_steps": int(file_cfg.get("mission_max_steps", 6)),
         "ram_min_mb":      int(file_cfg.get("ram_min_mb", 120)),
@@ -322,12 +323,21 @@ def tg_send(text):
 # 5. LLM CLIENT (AGNOSTIC)
 # =====================================================================
 def ask_llm(prompt, extra=""):
+    return ask_llm_msgs([{"role": "user", "content": prompt}], extra)
+
+def ask_llm_msgs(msgs, extra=""):
     if not budget_ok(): return json.dumps({"status": "FAILED", "reply": "Límite diario alcanzado."})
     inc_budget()
-    facts = search_facts(prompt)
+    first_user = next((m["content"] for m in msgs if m["role"] == "user"), "")
+    facts = search_facts(first_user)
     stats = get_stats()["str"]
     sys_prompt = (
-        f"Eres MicroBot v8 ({platform.system()}). Stats: {stats}. Memoria: {json.dumps(facts, ensure_ascii=False)}.\n"
+        f"Eres MicroBot v8 ({platform.system()}). Stats: {stats}. Memoria relevante: {json.dumps(facts, ensure_ascii=False)}.\n"
+        f"Protocolo ReAct: piensas, ejecutas UNA acción, lees la OBSERVATION y decides de nuevo.\n"
+        f"- Si necesitas datos del sistema: plan=[{{\"cmd\":\"UN solo comando\"}}] o search=\"query\".\n"
+        f"- Cuando la observación alcanza para responder: sin plan ni search, escribe reply final.\n"
+        f"- NUNCA repitas un mismo comando dentro de un turno; si falla, diagnostica con otro comando distinto.\n"
+        f"- new_fact: guarda recetas reutilizables (problema → solución), no trivialidades.\n"
         f"Devuelve SOLO JSON:\n"
         f'{{"thought":"...","plan":[{{"cmd":"","expect":""}}],"search":"","new_fact":"",'
         f'"status":"SUCCESS|CONTINUE|FAILED","reply":"...","alternatives":[]}}'
@@ -336,8 +346,10 @@ def ask_llm(prompt, extra=""):
     try:
         if "generativelanguage.googleapis.com" in CFG["base_url"]:
             url = f"{CFG['base_url']}/{CFG['model']}:generateContent?key={CFG['api_key']}"
+            contents = [{"role": ("model" if m["role"] == "assistant" else "user"),
+                         "parts": [{"text": m["content"]}]} for m in msgs]
             payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
+                "contents": contents,
                 "systemInstruction": {"parts": [{"text": sys_prompt}]}
             }
             res = requests.post(url, json=payload, timeout=60).json()
@@ -345,7 +357,7 @@ def ask_llm(prompt, extra=""):
         else:
             url = f"{CFG['base_url']}/chat/completions"
             h = {"Authorization": f"Bearer {CFG['api_key']}", "Content-Type": "application/json"}
-            payload = {"model":CFG["model"],"messages":[{"role":"system","content":sys_prompt},{"role":"user","content":prompt}]}
+            payload = {"model":CFG["model"],"messages":[{"role":"system","content":sys_prompt}] + msgs}
             res = requests.post(url, headers=h, json=payload, timeout=60).json()
             raw = res["choices"][0]["message"]["content"]
         m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -490,35 +502,73 @@ def dispatch(text, store=None):
     return False, None
 
 # =====================================================================
-# 10. AGENT TURN (PIPELINE VISIBLE)
+# 10. AGENT TURN (REACT: RAZONAR -> ACTUAR -> OBSERVAR, max N sub-pasos)
 # =====================================================================
+def _extract_action(data):
+    """Primera acción pedida por el modelo: ("search", q) | ("cmd", c) | None."""
+    if not isinstance(data, dict): return None
+    if data.get("search"): return ("search", str(data["search"]).strip())
+    plan = data.get("plan") or []
+    if plan:
+        p = plan[0]
+        cmd = (p.get("cmd", "").strip() if isinstance(p, dict) else str(p).strip())
+        if cmd: return ("cmd", cmd)
+    return None
+
+def _react_assistant_msg(thought, label):
+    return {"role": "assistant", "content": json.dumps(
+        {"thought": thought[:300], "action": label}, ensure_ascii=False)}
+
 def handle_turn(text, progress=None):
     if not resources_ok():
         return f"[PAUSA RECURSOS] {get_stats()['str']}", ""
-    if progress: progress("think")
-    data = parse_json(ask_llm(text))
-    if not data.get("reply") and not data.get("plan"):
+    max_steps = int(CFG.get("max_substeps", 3))
+    msgs = [{"role": "user", "content": text}]
+    tried = set()
+    step = 0
+    data = {}
+    while True:
         if progress: progress("think")
-        data = parse_json(ask_llm(text, "(respuesta vacía; repetí SOLO el JSON)"))
-        if not data.get("reply") and not data.get("plan"):
-            return "(sin respuesta del modelo)", ""
+        data = parse_json(ask_llm_msgs(msgs))
+        if not isinstance(data, dict) or not data:
+            if progress: progress("think")
+            data = parse_json(ask_llm_msgs(msgs + [{"role": "user", "content": "(respuesta vacía; repetí SOLO el JSON)"}]))
+            if not isinstance(data, dict) or not data:
+                return "(sin respuesta del modelo)", ""
+        action = _extract_action(data)
+        if data.get("status") == "FAILED" or action is None:
+            break                                   # concluyó (o se rindió): reply es la respuesta final
+        if step >= max_steps:
+            # Step Budget agotado: conclusión forzada, sin más acciones
+            if progress: progress("think")
+            msgs.append({"role": "user", "content":
+                "LÍMITE DE PASOS INTERNOS alcanzado. Respondé AHORA tu conclusión final "
+                "en JSON con reply (y new_fact si aprendiste una receta), sin plan ni search."})
+            data2 = parse_json(ask_llm_msgs(msgs))
+            if isinstance(data2, dict) and data2: data = data2
+            break
+        kind, payload = action
+        if progress: progress("search" if kind == "search" else "exec")
+        if kind == "cmd" and payload in tried:
+            # Loop Guard: no re-ejecutar; exigir estrategia distinta o conclusión
+            obs = ("OBSERVATION DEL SISTEMA: ya ejecutaste exactamente ese comando en este turno. "
+                   "NO lo repitas. Cambiá de enfoque con otro comando distinto, o devolvé tu "
+                   "conclusión final sin plan.")
+        elif kind == "search":
+            obs = web_search(payload)[:800]
+            tried.add(payload)
+        else:
+            obs = run_cmd(payload)[:800]
+            tried.add(payload)
+        msgs.append(_react_assistant_msg(data.get("thought", ""), f"{kind}: {payload}"))
+        msgs.append({"role": "user", "content": f"OBSERVATION:\n{obs}"})
+        step += 1
     if data.get("new_fact"): add_fact(data["new_fact"])
-    if data.get("search") and progress:
-        progress("search")
-        res = web_search(data["search"])
-        if progress: progress("think")
-        data = parse_json(ask_llm(text, f"WEB: {res}\nJSON final."))
-    reply = (data.get("reply") or "").strip()
+    add_history(text, (data.get("reply") or "")[:2000])
+    reply = (data.get("reply") or "").strip() or "(sin respuesta del modelo)"
     alts = data.get("alternatives") or []
-    out = []
-    if data.get("plan") and progress:
-        progress("exec")
-        for p in data["plan"]:
-            cmd = p.get("cmd","") if isinstance(p, dict) else str(p)
-            out.append(f"⚙️ `{cmd}`\n{run_cmd(cmd)}")
-    if reply: out.insert(0, reply)
-    alts_str = "\n".join(f"{i+1}. {a}" for i, a in enumerate(alts[:CFG.get("max_alternatives",2)]))
-    return "\n".join(out), (f"\n🤖 *Variantes:*\n{alts_str}" if alts_str else "")
+    alts_str = "\n".join(f"{i+1}. {a}" for i, a in enumerate(alts[:CFG.get("max_alternatives", 2)]))
+    return reply, (f"\n🤖 *Variantes:*\n{alts_str}" if alts_str else "")
 
 # =====================================================================
 # 11. DAEMONS

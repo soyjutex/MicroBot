@@ -88,6 +88,21 @@ def t_parse_prose():
 def t_stages():
     assert set(bot.STAGE.keys()) >= {"recv","think","search","exec"}
 
+# REACT HELPERS
+def t_react_action():
+    assert bot._extract_action({"plan":[{"cmd":"ls -la"}]}) == ("cmd", "ls -la")
+    assert bot._extract_action({"plan":["free -m"]}) == ("cmd", "free -m")
+    assert bot._extract_action({"search":"kernel debian 13"}) == ("search", "kernel debian 13")
+    assert bot._extract_action({"reply":"listo"}) is None
+    assert bot._extract_action({"plan":[{"cmd":""}]}) is None
+    assert bot._extract_action({"plan":[{"cmd":" a "},{"cmd":"b"}]}) == ("cmd", "a")
+
+def t_react_msg():
+    m = bot._react_assistant_msg("pensando X", "cmd: free -m")
+    assert m["role"] == "assistant"
+    d = json.loads(m["content"])
+    assert d["thought"] == "pensando X" and d["action"] == "cmd: free -m"
+
 # SKILLS
 def t_skill():
     db = os.path.join(tempfile.mkdtemp(), "t.db")
