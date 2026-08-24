@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)]
 [![RAM Idle](https://img.shields.io/badge/RAM_idle-~40MB-brightgreen.svg)]
-[![Tests](https://img.shields.io/badge/offline_tests-20%2F20-success.svg)]
+[![Tests](https://img.shields.io/badge/offline_tests-22%2F22-success.svg)]
 
 > **Agente autónomo de administración de sistemas en un solo archivo Python.**
 > Un `bot.py` idéntico para Linux, Windows y macOS. Pensado desde cero para hardware humilde.

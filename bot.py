@@ -6,7 +6,7 @@ Single-file, multiplatform (Linux/macOS/Windows/Termux).
 RAM ~35MB | Deps: Python 3.10+ + requests.
 """
 
-import os, sys, json, time, datetime, threading, subprocess, re, ast, platform, sqlite3, html, tempfile
+import os, sys, json, time, signal, datetime, threading, subprocess, re, ast, platform, sqlite3, html, tempfile
 from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
 import requests
@@ -107,17 +107,40 @@ BLOCKED_WIN = [r"Format-Volume", r"Remove-Item\s+-Recurse\s+[A-Za-z]:\\",
                r"format\s+[a-z]:", r"diskpart"]
 BLOCKED = BLOCKED_WIN if IS_WINDOWS else BLOCKED_UNIX
 
+def _kill_tree(p):
+    # Mata el árbol completo: sin huérfanos comiendo CPU tras un timeout
+    try:
+        if IS_WINDOWS:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except Exception:
+        try: p.kill()
+        except Exception: pass
+
 def run_cmd(cmd):
     for pat in BLOCKED:
         if re.search(pat, cmd, re.IGNORECASE): return "[BLOQUEADO] Comando peligroso."
+    full = ["powershell","-NoProfile","-NonInteractive","-Command",cmd] if IS_WINDOWS else ["bash","-c",cmd]
+    kwargs = dict(env={**os.environ,"PYTHONIOENCODING":"utf-8"})
+    if IS_WINDOWS:
+        p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, errors="replace",
+                             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, **kwargs)
+    else:
+        p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, errors="replace", start_new_session=True, **kwargs)
     try:
-        full = ["powershell","-NoProfile","-NonInteractive","-Command",cmd] if IS_WINDOWS else ["bash","-c",cmd]
-        r = subprocess.run(full, capture_output=True, text=True, timeout=CFG["cmd_timeout_sec"],
-                           errors="replace", env={**os.environ,"PYTHONIOENCODING":"utf-8"})
-        out = (r.stdout or "") + (("\n"+r.stderr) if r.stderr else "")
-        return out.strip()[:4000] if out.strip() else "(sin salida)"
-    except subprocess.TimeoutExpired: return f"[TIMEOUT {CFG['cmd_timeout_sec']}s]"
-    except Exception as e: return f"[ERROR] {e}"
+        out, err = p.communicate(timeout=CFG["cmd_timeout_sec"])
+        res = (out or "") + (("\n"+err) if err else "")
+        return res.strip()[:4000] or "(sin salida)"
+    except subprocess.TimeoutExpired:
+        _kill_tree(p)
+        return f"[TIMEOUT {CFG['cmd_timeout_sec']}s]"
+    except Exception as e:
+        _kill_tree(p)
+        return f"[ERROR] {e}"
 
 # ---- LOCK ----
 if IS_WINDOWS: import msvcrt
@@ -307,12 +330,29 @@ def tg_stage_edit(mid, text):
         time.sleep(1)
     return False
 
+def tg_chunk(text, limit=3800):
+    # Split inteligente: corta en el último \n antes del límite, no a machete
+    text = text or ""
+    if len(text) <= limit: return [text] if text else []
+    parts = []
+    while text:
+        if len(text) <= limit:
+            parts.append(text); break
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2: cut = limit
+        parts.append(text[:cut])
+        text = text[cut:] # Sin lstrip, preserva la integridad del join
+    return parts
+
 def finish_status(mid, reply, alts=""):
     full = f"{reply}\n\n{alts}" if alts else reply
-    if mid and len(full) <= 4000 and tg_stage_edit(mid, full):
+    chunks = tg_chunk(full)
+    if mid and len(chunks) == 1 and len(full) <= 4000 and tg_stage_edit(mid, full):
         outbox_flush(); return
-    tg_send_raw(reply)
-    if alts: time.sleep(1); tg_send_raw(alts)
+    for ch in ([full] if not chunks else chunks):
+        tg_send_raw(ch)
+        time.sleep(0.4)
+    outbox_flush()
 
 def tg_send(text):
     if tg_send_raw(text):
@@ -329,10 +369,17 @@ def ask_llm_msgs(msgs, extra=""):
     if not budget_ok(): return json.dumps({"status": "FAILED", "reply": "Límite diario alcanzado."})
     inc_budget()
     first_user = next((m["content"] for m in msgs if m["role"] == "user"), "")
-    facts = search_facts(first_user)
-    stats = get_stats()["str"]
+    # Separar hechos declarativos de playbooks procedurales (#7): la etiqueta
+    # ayuda a la atención del modelo a ejecutar la receta en vez de re-razonar.
+    mem = search_facts(first_user)
+    hechos = [f for f in mem if not f.startswith("[DISPARADOR:")]
+    playbooks = [f for f in mem if f.startswith("[DISPARADOR:")]
+    mem_str = ""
+    if hechos: mem_str += "\nHECHOS: " + json.dumps(hechos[:3], ensure_ascii=False)
+    if playbooks: mem_str += "\nPLAYBOOKS PROBADOS: " + "\n".join(playbooks[:3])
+    # Layout prompt-caching friendly (#1): protocolo estático PRIMERO, datos dinámicos AL FINAL.
     sys_prompt = (
-        f"Eres MicroBot v8 ({platform.system()}). Stats: {stats}. Memoria relevante: {json.dumps(facts, ensure_ascii=False)}.\n"
+        f"Eres MicroBot v8, agente sysadmin ({platform.system()}).\n"
         f"Protocolo ReAct: piensas, ejecutas UNA acción, lees la OBSERVATION y decides de nuevo.\n"
         f"- Si necesitas datos del sistema: plan=[{{\"cmd\":\"UN solo comando\"}}] o search=\"query\".\n"
         f"- Cuando la observación alcanza para responder: sin plan ni search, escribe reply final.\n"
@@ -343,14 +390,18 @@ def ask_llm_msgs(msgs, extra=""):
         f'{{"thought":"...","plan":[{{"cmd":"","expect":""}}],"search":"","new_fact":"",'
         f'"status":"SUCCESS|CONTINUE|FAILED","reply":"...","alternatives":[]}}'
         f"{extra}"
+        f"\n<datos_del_sistema host_stats=\"{get_stats()['str']}\"{mem_str} />"
     )
+    t0 = time.time()
     try:
+        temp = float(CFG.get("temperature", 0.1))
         if "generativelanguage.googleapis.com" in CFG["base_url"]:
             url = f"{CFG['base_url']}/{CFG['model']}:generateContent?key={CFG['api_key']}"
             contents = [{"role": ("model" if m["role"] == "assistant" else "user"),
                          "parts": [{"text": m["content"]}]} for m in msgs]
             payload = {
                 "contents": contents,
+                "generationConfig": {"temperature": temp},
                 "systemInstruction": {"parts": [{"text": sys_prompt}]}
             }
             res = requests.post(url, json=payload, timeout=60).json()
@@ -358,9 +409,11 @@ def ask_llm_msgs(msgs, extra=""):
         else:
             url = f"{CFG['base_url']}/chat/completions"
             h = {"Authorization": f"Bearer {CFG['api_key']}", "Content-Type": "application/json"}
-            payload = {"model":CFG["model"],"messages":[{"role":"system","content":sys_prompt}] + msgs}
+            payload = {"model":CFG["model"], "temperature": temp,
+                       "messages":[{"role":"system","content":sys_prompt}] + msgs}
             res = requests.post(url, headers=h, json=payload, timeout=60).json()
             raw = res["choices"][0]["message"]["content"]
+        kv_set("llm_last_ms", int((time.time()-t0)*1000))   # métrica pasiva para /ping
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         return m.group(0) if m else raw
     except Exception as e:
@@ -424,15 +477,31 @@ def validate_code(code):
 # =====================================================================
 # 8. COMMANDS ZERO-API
 # =====================================================================
+SHORTCUTS = {
+    "/disco": ["df -h / | tail -1", "Get-PSDrive -PSProvider FileSystem | Format-Table Name,@{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}},@{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}"],
+    "/top": ["ps aux --sort=-%mem | head -6", "Get-Process | Sort-Object WS -Descending | Select-Object -First 5 Name,@{n='RAM_MB';e={[math]::Round($_.WS/1MB)}} | Format-Table -AutoSize"],
+    "/ip": ["hostname -I 2>/dev/null || ip -4 addr show scope global | grep inet | head -1", "(Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp,Manual).IPAddress"]
+}
+
 def dispatch(text):
     t = text.strip(); tl = t.lower()
     if tl == "/help":
-        return True, ("🤖 *MicroBot v8 Universal*\n"
-            "/status  /recursos  /mision <objetivo>  /skills  /restart\n"
-            "/todo add|list|done  /nota set|get|list  /idea  /agenda\n"
-            "Pipeline visible activo. Memoria FTS5.")
-    if tl == "/status":
-        return True, f"📊 {get_stats()['str']}\nHechos: {db().execute('SELECT COUNT(*) FROM facts').fetchone()[0]}"
+        return True, ("🤖 *MicroBot v8.1*\n"
+            "/status /recursos /disco /top /ip /ping /clear\n"
+            "/mision <objetivo> /todo /nota /idea /agenda /skills")
+    if tl in SHORTCUTS:
+        cmd = SHORTCUTS[tl][1 if IS_WINDOWS else 0]
+        return True, f"⚙️ `{cmd}`\n{run_cmd(cmd)}"
+    if tl == "/ping":
+        t0 = time.time()
+        requests.get(f"https://api.telegram.org/bot{CFG['telegram_token']}/getMe", timeout=5)
+        rtt = int((time.time() - t0) * 1000)
+        llm = kv_get("llm_last_ms", 0)
+        return True, f"🏓 RTT Telegram: {rtt}ms\n🧠 Latencia LLM: {llm}ms"
+    if tl in ("/clear", "/olvidar"):
+        with db() as c: c.execute("DELETE FROM history")
+        return True, "🧹 Historial borrado."
+    # ... resto de dispatch original (todo, nota, idea, agenda, mision) ...
     if tl == "/recursos":
         return True, get_stats()["str"]
     if tl == "/skills":
@@ -505,6 +574,11 @@ def _react_assistant_msg(thought, label):
     return {"role": "assistant", "content": json.dumps(
         {"thought": thought[:300], "action": label}, ensure_ascii=False)}
 
+_ERR_PAT = re.compile(r"error|failed|denied|no such|not found|cannot|no se |inexistente|\[timeout|traceback", re.I)
+
+def _looks_error(out):
+    return bool(_ERR_PAT.search((out or "")[:400]))
+
 def handle_turn(text, progress=None, max_substeps=None):
     if not resources_ok():
         return f"[PAUSA RECURSOS] {get_stats()['str']}", ""
@@ -513,6 +587,7 @@ def handle_turn(text, progress=None, max_substeps=None):
     tried = set()
     step = 0
     data = {}
+    prev_fail = None   # comando anterior cuya salida pareció error (#3 post-mortem)
     while True:
         if progress: progress("think")
         data = parse_json(ask_llm_msgs(msgs))
@@ -544,8 +619,15 @@ def handle_turn(text, progress=None, max_substeps=None):
             obs = web_search(payload)[:800]
             tried.add(payload)
         else:
-            obs = run_cmd(payload)[:800]
+            out = run_cmd(payload)
+            # Post-mortem automático: falló A, probó B y B salió bien => receta gratis
+            if prev_fail and not _looks_error(out):
+                add_fact(f"[DISPARADOR: el comando '{prev_fail}' falla] -> "
+                         f"[SOLUCION: '{payload}' resuelve]")
+                prev_fail = None
+            obs = out[:800]
             tried.add(payload)
+            if _looks_error(out): prev_fail = payload
         msgs.append(_react_assistant_msg(data.get("thought", ""), f"{kind}: {payload}"))
         msgs.append({"role": "user", "content": f"OBSERVATION:\n{obs}"})
         step += 1
@@ -576,7 +658,10 @@ def compressor():
         if now.hour == 4 and now.minute < 5:
             with db() as c:
                 c.execute("DELETE FROM facts WHERE id NOT IN (SELECT MIN(id) FROM facts GROUP BY fact)")
-                c.execute("VACUUM"); c.commit()
+                c.commit()
+            with db() as c:
+                c.execute("VACUUM")
+                c.execute("PRAGMA wal_checkpoint(TRUNCATE);")  # el -wal no crece infinito en HDD
         time.sleep(60)
 
 def scheduler():

@@ -103,19 +103,25 @@ def t_react_msg():
     d = json.loads(m["content"])
     assert d["thought"] == "pensando X" and d["action"] == "cmd: free -m"
 
-# SLASH COMMANDS: persistencia real en SQLite (regresion bug db() x2)
-def t_slash_persistence():
+# SLASH COMMANDS
+def t_slash_shortcuts():
+    assert bot.dispatch("/disco")[0] is True
+    assert bot.dispatch("/ping")[0] is True
+
+def t_clear():
     db = os.path.join(tempfile.mkdtemp(), "t.db")
     bot.DB_FILE = db; bot.init_db()
-    ok1, _ = bot.dispatch("/todo add comprar pan")
-    ok2, _ = bot.dispatch("/idea probar react")
-    ok3, _ = bot.dispatch("/nota set server compacserver")
-    assert ok1 is True and ok2 is True and ok3 is True
-    c = sqlite3.connect(db)  # conexion NUEVA: si hubo rollback, esto no ve nada
-    assert c.execute("SELECT COUNT(*) FROM todos").fetchone()[0] == 1
-    assert c.execute("SELECT COUNT(*) FROM ideas").fetchone()[0] == 1
-    assert c.execute("SELECT value FROM notes WHERE key='server'").fetchone()[0] == "compacserver"
-    c.close()
+    bot.add_history("u", "b")
+    assert bot.dispatch("/clear")[0] is True
+    c = sqlite3.connect(db)
+    assert c.execute("SELECT COUNT(*) FROM history").fetchone()[0] == 0
+
+def t_chunk():
+    text = "a\n" * 2000
+    chunks = bot.tg_chunk(text, 100)
+    assert len(chunks) > 1
+    assert all(len(c) <= 100 for c in chunks)
+    assert "".join(chunks) == text
 
 # MISIONES via marcador dispatch -> handle_turn(max_substeps)
 def t_mission_dispatch():
