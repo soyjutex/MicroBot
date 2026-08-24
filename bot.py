@@ -449,11 +449,10 @@ def ask_llm_msgs(msgs, extra=""):
     if not budget_ok(): return json.dumps({"status": "FAILED", "reply": "Límite diario alcanzado."})
     inc_budget()
     first_user = next((m["content"] for m in msgs if m["role"] == "user"), "")
-    # Separar hechos declarativos de playbooks procedurales (#7): la etiqueta
-    # ayuda a la atención del modelo a ejecutar la receta en vez de re-razonar.
-    mem = search_facts(first_user)
-    hechos = [f for f in mem if not f.startswith("[DISPARADOR:")]
-    playbooks = [f for f in mem if f.startswith("[DISPARADOR:")]
+    facts = search_facts(first_user)
+    stats = get_stats()["str"]
+    hechos = [f for f in facts if not f.startswith("[DISPARADOR:")]
+    playbooks = [f for f in facts if f.startswith("[DISPARADOR:")]
     mem_str = ""
     if hechos: mem_str += "\nHECHOS: " + json.dumps(hechos[:3], ensure_ascii=False)
     if playbooks: mem_str += "\nPLAYBOOKS PROBADOS: " + "\n".join(playbooks[:3])
