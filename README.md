@@ -154,7 +154,7 @@ Las variantes son opcionales para el modelo: solo aparecen cuando aportan valor 
 ├── dashboard/              # dashboard web simple (CPU/RAM/temp/logs)
 │   ├── dashboard.html      # interfaz (HTML+CSS+JS puro, sin frameworks)
 │   └── server.py           # servidor stdlib de solo lectura, puerto 8080
-└── docs/                   # historia, protocolos de mantenimiento y bitácoras
+└── docs/                   # arquitectura, historia y guía de operación
 ```
 
 En runtime (servidor):
@@ -181,11 +181,9 @@ En runtime (servidor):
 
 ## Documentación
 
-- [`docs/HISTORIA.md`](docs/HISTORIA.md) — cronología completa del proyecto, problemas encontrados y decisiones de diseño.
-- [`docs/PROTOCOLO_MANTENIMIENTO.md`](docs/PROTOCOLO_MANTENIMIENTO.md) — cómo desplegar cambios sin romper nada.
-- [`docs/BITACORA_Y_OPTIMIZACION.md`](docs/BITACORA_Y_OPTIMIZACION.md) — lecciones aprendidas y reglas de operación.
-- [`docs/BITACORA_EVOLUCION.md`](docs/BITACORA_EVOLUCION.md) — evolución v1→v6.
-- [`docs/PROTOCOL_RAPIDO.md`](docs/PROTOCOL_RAPIDO.md) — patrones de operación rápida.
+- [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md) — cómo funciona por dentro: flujo, protocolo JSON, memoria FTS5, presupuesto y seguridad.
+- [`docs/HISTORIA.md`](docs/HISTORIA.md) — cronología completa: cómo creció de script a agente autónomo multiplataforma.
+- [`docs/OPERACION.md`](docs/OPERACION.md) — instalación, actualización, backups y diagnóstico rápido.
 
 ## Hardware de origen
 
